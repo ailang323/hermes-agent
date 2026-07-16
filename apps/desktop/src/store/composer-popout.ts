@@ -1,9 +1,11 @@
 import { atom } from 'nanostores'
 
 import { persistBoolean, persistString, storedBoolean, storedString } from '@/lib/storage'
+import { $activeGatewayProfile } from '@/store/profile'
 
-const POPOUT_ENABLED_STORAGE_KEY = 'hermes.desktop.composerPopout.enabled'
-const POPOUT_POSITION_STORAGE_KEY = 'hermes.desktop.composerPopout.position'
+const LEGACY_POPOUT_ENABLED_STORAGE_KEY = 'hermes.desktop.composerPopout.enabled'
+const LEGACY_POPOUT_POSITION_STORAGE_KEY = 'hermes.desktop.composerPopout.position'
+const POPOUT_STORAGE_PREFIX = 'hermes.desktop.composerPopout.v2'
 
 /** Where the floating composer's bottom-right corner sits, measured as an inset
  *  from the viewport's bottom/right edges. Anchoring to the bottom-right keeps
@@ -22,8 +24,18 @@ export const POPOUT_WIDTH_REM = 19.5
 // of the window chrome. Matches the brief's "default to the right bottom".
 const DEFAULT_POSITION: PopoutPosition = { bottom: 24, right: 24 }
 
-function readPosition(): PopoutPosition {
-  const raw = storedString(POPOUT_POSITION_STORAGE_KEY)
+function normalizeProfileKey(name: string | null | undefined): string {
+  const value = (name ?? '').trim()
+
+  return value || 'default'
+}
+
+function profileStorageKey(profile: string, kind: 'enabled' | 'position'): string {
+  return `${POPOUT_STORAGE_PREFIX}.${encodeURIComponent(normalizeProfileKey(profile))}.${kind}`
+}
+
+function readPosition(profile: string): PopoutPosition {
+  const raw = storedString(profileStorageKey(profile, 'position')) ?? storedString(LEGACY_POPOUT_POSITION_STORAGE_KEY)
 
   if (!raw) {
     return DEFAULT_POSITION
@@ -110,12 +122,32 @@ function clampPosition({ bottom, right }: PopoutPosition, size?: PopoutSize, are
   }
 }
 
-export const $composerPoppedOut = atom(storedBoolean(POPOUT_ENABLED_STORAGE_KEY, false))
-export const $composerPopoutPosition = atom<PopoutPosition>(readPosition())
+let activeProfile = normalizeProfileKey($activeGatewayProfile.get())
+
+function readEnabled(profile: string): boolean {
+  // Never migrate the legacy global enabled flag: one stale value would pop
+  // the composer out in every profile. Legacy position is safe as a fallback.
+  void LEGACY_POPOUT_ENABLED_STORAGE_KEY
+
+  return storedBoolean(profileStorageKey(profile, 'enabled'), false)
+}
+
+export const $composerPoppedOut = atom(readEnabled(activeProfile))
+export const $composerPopoutPosition = atom<PopoutPosition>(readPosition(activeProfile))
+
+$activeGatewayProfile.subscribe(profile => {
+  const nextProfile = normalizeProfileKey(profile)
+
+  if (nextProfile === activeProfile) {return}
+
+  activeProfile = nextProfile
+  $composerPoppedOut.set(readEnabled(activeProfile))
+  $composerPopoutPosition.set(readPosition(activeProfile))
+})
 
 export function setComposerPoppedOut(value: boolean) {
   $composerPoppedOut.set(value)
-  persistBoolean(POPOUT_ENABLED_STORAGE_KEY, value)
+  persistBoolean(profileStorageKey(activeProfile, 'enabled'), value)
 }
 
 /** Move the box (state only by default). Used per-frame during a drag — no IO
@@ -130,7 +162,7 @@ export function setComposerPopoutPosition(
   $composerPopoutPosition.set(next)
 
   if (persist) {
-    persistString(POPOUT_POSITION_STORAGE_KEY, JSON.stringify(next))
+    persistString(profileStorageKey(activeProfile, 'position'), JSON.stringify(next))
   }
 
   return next
