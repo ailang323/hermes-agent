@@ -341,8 +341,51 @@ def load_hermes_dotenv(
 
     _apply_external_secret_sources(home_path)
     _apply_managed_env()
+    _apply_macos_system_proxy()
 
     return loaded
+
+
+def _apply_macos_system_proxy() -> None:
+    """Bridge an enabled macOS HTTP(S) system proxy into CLI env vars.
+
+    Explicit ``HTTP_PROXY``/``HTTPS_PROXY`` values always win. Fail open on
+    non-macOS hosts, PAC-only configurations, and ``scutil`` errors.
+    """
+    if os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY"):
+        return
+    if sys.platform != "darwin":
+        return
+
+    import re
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["scutil", "--proxy"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return
+    if result.returncode != 0:
+        return
+
+    props = {
+        match.group(1): match.group(2)
+        for match in re.finditer(r"^\s*(\w+)\s*:\s*(.+?)\s*$", result.stdout, re.MULTILINE)
+    }
+
+    if props.get("HTTPEnable") == "1":
+        host, port = props.get("HTTPProxy", ""), props.get("HTTPPort", "0")
+        if host and port != "0":
+            os.environ["HTTP_PROXY"] = f"http://{host}:{port}"
+
+    if props.get("HTTPSEnable") == "1":
+        host, port = props.get("HTTPSProxy", ""), props.get("HTTPSPort", "0")
+        if host and port != "0":
+            os.environ["HTTPS_PROXY"] = f"http://{host}:{port}"
 
 
 def _apply_managed_env() -> None:
