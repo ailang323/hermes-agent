@@ -1,5 +1,6 @@
 import { memo, useCallback, useMemo, useRef, useState } from 'react'
 
+import { FloatingQuoteButton } from '@/components/assistant-ui/floating-quote-button'
 import { AssistantMessage } from '@/components/assistant-ui/thread/assistant-message'
 import { ThreadMessageList } from '@/components/assistant-ui/thread/list'
 import { BackgroundResumeNotice, CenteredThreadSpinner } from '@/components/assistant-ui/thread/status'
@@ -156,6 +157,7 @@ export const Thread = memo(function Thread({
       />
       {loading === 'session' && <CenteredThreadSpinner />}
       <ThreadTimeline />
+      <FloatingQuoteButton />
       <ConfirmDialog
         confirmLabel={copy.restoreConfirm}
         description={copy.restoreBody}

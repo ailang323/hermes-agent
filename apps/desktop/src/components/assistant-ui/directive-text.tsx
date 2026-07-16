@@ -13,7 +13,7 @@ import { useSessionLinkTitle } from '@/lib/session-link-title'
 import { parseSessionRefValue, sessionRefFallbackLabel } from '@/lib/session-refs'
 import { cn } from '@/lib/utils'
 
-const HERMES_REF_TYPES = ['file', 'folder', 'url', 'image', 'tool', 'line', 'terminal', 'session'] as const
+const HERMES_REF_TYPES = ['file', 'folder', 'url', 'image', 'tool', 'line', 'terminal', 'selection', 'session'] as const
 type HermesRefType = (typeof HERMES_REF_TYPES)[number]
 
 /** Single source of truth for chip icon glyphs (Tabler outline @ 24×24).
@@ -44,6 +44,12 @@ const ICON_PATHS: Record<HermesRefType, string[]> = {
   tool: ['M7 10h3v-3l-3.5 -3.5a6 6 0 0 1 8 8l6 6a2 2 0 0 1 -3 3l-6 -6a6 6 0 0 1 -8 -8l3.5 3.5'],
   line: ['M5 9l14 0', 'M5 15l14 0', 'M11 4l-4 16', 'M17 4l-4 16'],
   terminal: ['M5 7l5 5l-5 5', 'M12 19l7 0'],
+  selection: [
+    'M7 7h6',
+    'M7 11h10',
+    'M7 15h8',
+    'M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2z'
+  ],
   session: ['M4 4h16v2.172a2 2 0 0 1 -.586 1.414l-4.414 4.414v7l-6 2v-8.5l-4.48 -4.928a2 2 0 0 1 -.52 -1.345v-2.227']
 }
 
@@ -168,7 +174,7 @@ export const DIRECTIVE_CHIP_CLASS =
 const CANONICAL_DIRECTIVE_RE = /:([\w-]{1,64})\[([^\]\n]{1,1024})\](?:\{name=([^}\n]{1,1024})\})?/g
 
 const HERMES_DIRECTIVE_RE = new RegExp(
-  '@(file|folder|url|image|tool|line|terminal|session):(' +
+  '@(file|folder|url|image|tool|line|terminal|selection|session):(' +
     '`[^`\\n]+`' +
     '|"[^"\\n]+"' +
     "|'[^'\\n]+'" +
