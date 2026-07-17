@@ -63,12 +63,20 @@ function TooltipTrigger({ onFocus, ...props }: React.ComponentProps<typeof Toolt
   )
 }
 
+type TooltipAppearance = 'label' | 'panel'
+
+type TooltipContentProps = React.ComponentProps<typeof TooltipPrimitive.Content> & {
+  appearance?: TooltipAppearance
+}
+
 function TooltipContent({
+  appearance = 'label',
   className,
   sideOffset = 6,
   children,
+  style,
   ...props
-}: React.ComponentProps<typeof TooltipPrimitive.Content>) {
+}: TooltipContentProps) {
   return (
     <TooltipPrimitive.Portal>
       <TooltipPrimitive.Content
@@ -78,9 +86,14 @@ function TooltipContent({
         // rectangular dead space). Instant, no transition (delayDuration=0).
         // pointer-events-none: the tip must never steal hover/clicks from the
         // chrome underneath (titlebar tools, adjacent tabs, etc.).
-        className={cn('pointer-events-none z-[200] w-fit max-w-64 select-none', className)}
+        className={cn(
+          'pointer-events-none z-[200] select-none',
+          appearance === 'label' && 'w-fit max-w-64',
+          className
+        )}
         data-slot="tooltip-content"
         sideOffset={sideOffset}
+        style={appearance === 'panel' ? { width: '18rem', maxWidth: 'calc(100vw - 1rem)', ...style } : style}
         {...props}
       >
         {/* bg-foreground/text-background auto-inverts per theme. leading-normal
@@ -90,15 +103,28 @@ function TooltipContent({
             this inline decoration's geometry, so Radix measures a zero-size chip
             and parks an empty rectangle in the corner (#62022). Force any direct
             child inline-flex so every call site stays safe. */}
-        <span className="box-decoration-clone inline bg-foreground px-1.5 py-1 text-[11px] font-bold leading-normal text-background [font-family:Arial,sans-serif] [&>*]:!inline-flex">
-          {children}
-        </span>
+        {appearance === 'panel' ? (
+          <div
+            className="rounded-md border border-(--ui-stroke-secondary) bg-(--ui-chat-surface-background) px-2.5 py-2 text-xs leading-snug text-foreground shadow-md"
+            data-slot="tooltip-panel"
+            style={{ width: '100%' }}
+          >
+            {children}
+          </div>
+        ) : (
+          <span
+            className="box-decoration-clone inline bg-foreground px-1.5 py-1 text-[11px] font-bold leading-normal text-background [font-family:Arial,sans-serif] [&>*]:!inline-flex"
+            data-slot="tooltip-decoration"
+          >
+            {children}
+          </span>
+        )}
       </TooltipPrimitive.Content>
     </TooltipPrimitive.Portal>
   )
 }
 
-interface TipProps extends Omit<React.ComponentProps<typeof TooltipPrimitive.Content>, 'content'> {
+interface TipProps extends Omit<TooltipContentProps, 'content'> {
   label: React.ReactNode
   children: React.ReactNode
   delayDuration?: number

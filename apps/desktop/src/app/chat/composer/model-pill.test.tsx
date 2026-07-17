@@ -1,10 +1,17 @@
-import { cleanup, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { atom } from 'nanostores'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import type { ChatBarState } from '@/app/chat/composer/types'
 import { type SessionView, SessionViewProvider } from '@/app/chat/session-view'
-import { $activeSessionId, $currentModel, setCurrentModel, setCurrentModelSource } from '@/store/session'
+import { registry } from '@/contrib'
+import {
+  $activeSessionId,
+  $currentModel,
+  setCurrentModel,
+  setCurrentModelSource,
+  setCurrentProvider
+} from '@/store/session'
 
 import { ModelPill } from './model-pill'
 
@@ -20,6 +27,7 @@ afterEach(() => {
   $activeSessionId.set(null)
   setCurrentModel('')
   setCurrentModelSource('')
+  setCurrentProvider('')
 })
 
 // #62055: a manual composer pick is sticky and silently overrides the
@@ -112,5 +120,100 @@ describe('ModelPill per-surface model label', () => {
 
     expect(screen.getByText('Sonnet · High')).toBeTruthy()
     expect(screen.queryByText(/primary/i)).toBeNull()
+  })
+})
+
+describe('ModelPill tooltip contributions', () => {
+  it('renders plugin details inside the model hover tooltip', async () => {
+    setCurrentModel('gpt-test')
+    setCurrentProvider('openai-codex')
+    let dispose = () => {}
+    act(() => {
+      dispose = registry.register({
+        area: 'composer.model.tooltip',
+        id: 'test-quota',
+        render: context => (
+          <span>
+            Codex 额度：剩余 88% · {String(context?.provider)}:{String(context?.model)}
+          </span>
+        )
+      })
+    })
+
+    try {
+      render(
+        <ModelPill
+          disabled={false}
+          model={{
+            canSwitch: true,
+            model: 'gpt-test',
+            modelMenuContent: <div>model menu</div>,
+            provider: 'openai-codex'
+          }}
+        />
+      )
+
+      const trigger = screen.getByRole('button', { name: /openai-codex: gpt-test/i })
+      fireEvent.pointerMove(trigger, { pointerType: 'mouse' })
+
+      const tooltip = await screen.findByRole('tooltip')
+      expect(tooltip.textContent).toContain('openai-codex')
+      expect(tooltip.textContent).toContain('gpt-test')
+      expect(tooltip.textContent).toContain('Codex 额度：剩余 88%')
+      expect(tooltip.textContent).toContain('openai-codex:gpt-test')
+      expect(tooltip.querySelector('[data-slot="tooltip-panel"]')).toBeTruthy()
+    } finally {
+      act(() => dispose())
+    }
+  })
+
+  it('passes the hovered tile model instead of the primary model to contributions', async () => {
+    setCurrentModel('gpt-primary')
+    setCurrentProvider('openai-codex')
+
+    const tileView: SessionView = {
+      kind: 'tile',
+      $awaitingResponse: atom(false),
+      $busy: atom(false),
+      $cwd: atom(''),
+      $fast: atom(false),
+      $lastVisibleIsUser: atom(false),
+      $messages: atom([]),
+      $messagesEmpty: atom(true),
+      $model: atom('claude-tile'),
+      $provider: atom('anthropic'),
+      $reasoningEffort: atom(''),
+      $runtimeId: atom('tile-runtime'),
+      $storedId: atom('stored-tile')
+    }
+
+    let dispose = () => {}
+    act(() => {
+      dispose = registry.register({
+        area: 'composer.model.tooltip',
+        id: 'surface-probe',
+        render: context => <span>{`${String(context?.provider)}:${String(context?.model)}`}</span>
+      })
+    })
+
+    try {
+      render(
+        <SessionViewProvider value={tileView}>
+          <ModelPill
+            disabled={false}
+            model={modelState({ model: 'claude-tile', provider: 'anthropic', modelMenuContent: <div /> })}
+          />
+        </SessionViewProvider>
+      )
+
+      const trigger = screen.getByRole('button', { name: /anthropic: claude-tile/i })
+      fireEvent.pointerMove(trigger, { pointerType: 'mouse' })
+
+      const tooltip = await screen.findByRole('tooltip')
+      expect(tooltip.textContent).toContain('anthropic:claude-tile')
+      expect(tooltip.textContent).not.toContain('openai-codex:gpt-primary')
+    } finally {
+      act(() => dispose())
+    }
   })
 })

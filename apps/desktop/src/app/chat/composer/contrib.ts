@@ -7,6 +7,7 @@
  *                             composer.bottom   — row below the input grid
  *                             composer.leading  — inline after the "+" menu
  *                             composer.actions  — inline before the model pill
+ *                             composer.modelTooltip — details inside model hover
  *
  *   data kinds (`data`):      composer.middleware   (ComposerMiddleware)
  *                             composer.attachments  (ComposerAttachmentProvider)
@@ -26,6 +27,7 @@ export const COMPOSER_AREAS = {
   bottom: 'composer.bottom',
   leading: 'composer.leading',
   actions: 'composer.actions',
+  modelTooltip: 'composer.model.tooltip',
   middleware: 'composer.middleware',
   attachments: 'composer.attachments'
 } as const
