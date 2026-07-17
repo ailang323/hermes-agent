@@ -1,6 +1,6 @@
 import { useStore } from '@nanostores/react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { createContext, useContext, useMemo, useState } from 'react'
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react'
 
 import { useSessionView } from '@/app/chat/session-view'
 import { Codicon } from '@/components/ui/codicon'
@@ -69,6 +69,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   const { t } = useI18n()
   const copy = t.shell.modelMenu
   const closeMenu = useContext(ModelMenuCloseContext)
+  const activeRowRef = useRef<HTMLDivElement>(null)
   const [search, setSearch] = useState('')
   const [refreshing, setRefreshing] = useState(false)
   const queryClient = useQueryClient()
@@ -212,6 +213,10 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
     [pickerProviders, search, optionsModel, optionsProvider, effectiveVisibleModels]
   )
 
+  useEffect(() => {
+    activeRowRef.current?.scrollIntoView({ block: 'nearest' })
+  }, [groups, optionsModel, optionsProvider])
+
   return (
     <>
       <DropdownMenuSearch aria-label={copy.search} onValueChange={setSearch} placeholder={copy.search} value={search} />
@@ -329,6 +334,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
                               activate()
                             }
                           }}
+                          ref={isCurrent ? activeRowRef : undefined}
                         >
                           <span className="min-w-0 flex-1 truncate">
                             {name}

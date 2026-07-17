@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { DropdownMenu, DropdownMenuContent } from '@/components/ui/dropdown-menu'
@@ -267,5 +267,30 @@ describe('ModelMenuPanel provider collapse', () => {
 
     expect($collapsedProviders.get()).toContain('google')
     expect($collapsedProviders.get()).toContain('deepseek')
+  })
+})
+
+describe('ModelMenuPanel model rows', () => {
+  it('scrolls the current model into the visible list when the menu opens', async () => {
+    $currentProvider.set('openai-codex')
+    $currentModel.set('gpt-current')
+    getGlobalModelOptions.mockResolvedValue({
+      model: 'gpt-current',
+      provider: 'openai-codex',
+      providers: [
+        {
+          models: ['gpt-first', 'gpt-current', 'gpt-next'],
+          name: 'OpenAI Codex',
+          slug: 'openai-codex'
+        }
+      ]
+    })
+
+    const { content } = renderPanel()
+    await content.findByText(/GPT-current/i)
+
+    await waitFor(() => {
+      expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' })
+    })
   })
 })
