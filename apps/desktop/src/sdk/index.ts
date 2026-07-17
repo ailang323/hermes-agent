@@ -26,7 +26,7 @@ import { getLogs, getStatus } from '@/hermes'
 import { $gateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
-import { $activeSessionId, $currentCwd, $currentModel, $gatewayState } from '@/store/session'
+import { $activeSessionId, $currentCwd, $currentModel, $currentProvider, $gatewayState } from '@/store/session'
 import { runGatewayRestart } from '@/store/system-actions'
 
 // -- state: readonly views over the app's live atoms -------------------------
@@ -65,6 +65,8 @@ export const host = {
     gateway: readonlyAtom<string>($gatewayState),
     /** Current main model slug. */
     model: readonlyAtom<string>($currentModel),
+    /** Provider slug for the current main model. */
+    provider: readonlyAtom<string>($currentProvider),
     /** Profile the live gateway is routed to. */
     profile: readonlyAtom<string>($activeGatewayProfile),
     /** Window geometry ({ width, height, narrow }). */

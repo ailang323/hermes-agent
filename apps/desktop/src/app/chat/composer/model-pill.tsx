@@ -7,12 +7,14 @@ import { Button } from '@/components/ui/button'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { Tip } from '@/components/ui/tooltip'
+import { Slot } from '@/contrib'
 import { useI18n } from '@/i18n'
 import { ChevronDown } from '@/lib/icons'
 import { formatModelStatusLabel } from '@/lib/model-status-label'
 import { cn } from '@/lib/utils'
 import { $currentModelSource, $defaultReasoningEffort, setModelPickerOpen } from '@/store/session'
 
+import { COMPOSER_AREAS } from './contrib'
 import type { ChatBarState } from './types'
 
 const PILL = cn(
@@ -99,12 +101,19 @@ export function ModelPill({
   const baseTitle = currentProvider
     ? copy.modelTitle(currentProvider, currentModel || copy.modelNone)
     : copy.switchModel
-
   const title = pinnedOverride ? `${baseTitle} — ${copy.modelPinned}` : baseTitle
+  const tooltip = (
+    <div className="grid min-w-0 gap-1.5 text-left">
+      <div className="border-b border-(--ui-stroke-tertiary) pb-1 text-[11px] font-medium text-(--ui-text-tertiary)">
+        {title}
+      </div>
+      <Slot area={COMPOSER_AREAS.modelTooltip} context={{ model: currentModel, provider: currentProvider }} />
+    </div>
+  )
 
   if (!model.modelMenuContent) {
     return (
-      <Tip label={pinnedOverride ? `${copy.openModelPicker} — ${copy.modelPinned}` : copy.openModelPicker} side="top">
+      <Tip appearance="panel" label={tooltip} side="top" sideOffset={8}>
         <Button
           aria-label={copy.openModelPicker}
           className={pillClass}
@@ -121,7 +130,7 @@ export function ModelPill({
 
   return (
     <DropdownMenu onOpenChange={setOpen} open={open}>
-      <Tip label={title} side="top">
+      <Tip appearance="panel" label={tooltip} side="top" sideOffset={8}>
         <DropdownMenuTrigger asChild>
           <Button aria-label={title} className={pillClass} disabled={disabled} type="button" variant="ghost">
             {label}

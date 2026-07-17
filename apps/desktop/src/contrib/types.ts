@@ -9,6 +9,11 @@ import type { ReactNode } from 'react'
  */
 export type ContributionSource = 'core' | (string & {})
 
+/** Optional, host-supplied context for the exact surface rendering a slot.
+ *  Existing contributions remain compatible: zero-argument render functions
+ *  simply ignore it, and hosts that have no scoped state omit it. */
+export type ContributionRenderContext = Readonly<Record<string, unknown>>
+
 /**
  * The single, uniform primitive every surface consumes. A bar renders these as
  * inline items via `<Slot>`; a dock renders them as stacked/tabbed panes via
@@ -34,7 +39,7 @@ export interface Contribution {
   /** Soft disable without unregistering. `false` hides it. */
   enabled?: boolean
   /** Renders the contribution's content (UI contributions). */
-  render?: () => ReactNode
+  render?: (context?: ContributionRenderContext) => ReactNode
   /**
    * Declarative payload for data contributions (Family B): layout presets,
    * themes, commands — anything consumed by an engine rather than rendered.
