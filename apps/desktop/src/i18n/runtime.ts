@@ -1,8 +1,10 @@
+import { atom } from 'nanostores'
+
 import { TRANSLATIONS } from './catalog'
 import { DEFAULT_LOCALE } from './languages'
 import type { Locale } from './types'
 
-let runtimeLocale: Locale = DEFAULT_LOCALE
+export const $runtimeLocale = atom<Locale>(DEFAULT_LOCALE)
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -52,15 +54,15 @@ export function translateFrom(
 }
 
 export function setRuntimeI18nLocale(locale: Locale) {
-  runtimeLocale = locale
+  $runtimeLocale.set(locale)
 }
 
 /** The locale module-level translators resolve against (the app's active
- *  `display.language`). Plugin `ctx.i18n.t` reads this too. */
+ *  `display.language`). Plugin `ctx.i18n.t` and `host.state.locale` read this. */
 export function getRuntimeI18nLocale(): Locale {
-  return runtimeLocale
+  return $runtimeLocale.get()
 }
 
 export function translateNow(key: string, ...args: unknown[]): string {
-  return translateFrom(locale => TRANSLATIONS[locale], runtimeLocale, key, args)
+  return translateFrom(locale => TRANSLATIONS[locale], $runtimeLocale.get(), key, args)
 }

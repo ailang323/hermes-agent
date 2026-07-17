@@ -23,6 +23,7 @@ import { atom, type ReadableAtom } from 'nanostores'
 import { $narrowViewport } from '@/components/pane-shell/tree/store'
 import { onGatewayEvent } from '@/contrib/events'
 import { getLogs, getStatus } from '@/hermes'
+import { $runtimeLocale } from '@/i18n/runtime'
 import { $gateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
@@ -63,6 +64,8 @@ export const host = {
     cwd: readonlyAtom<string>($currentCwd),
     /** Gateway socket state: 'idle' | 'connecting' | 'open' | …. */
     gateway: readonlyAtom<string>($gatewayState),
+    /** Hermes display language selected in Settings. */
+    locale: readonlyAtom($runtimeLocale),
     /** Current main model slug. */
     model: readonlyAtom<string>($currentModel),
     /** Provider slug for the current main model. */
