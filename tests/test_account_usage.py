@@ -66,6 +66,7 @@ def test_fetch_account_usage_codex(monkeypatch):
         "agent.account_usage.httpx.Client",
         lambda timeout=15.0: _Client(
             {
+                "account_email": "codex-user@example.com",
                 "plan_type": "pro",
                 "rate_limit": {
                     "primary_window": {
@@ -88,6 +89,8 @@ def test_fetch_account_usage_codex(monkeypatch):
 
     assert snapshot is not None
     assert snapshot.plan == "Pro"
+    assert snapshot.account_email == "codex-user@example.com"
+    assert snapshot.account_id == "acct_123"
     assert len(snapshot.windows) == 2
     assert snapshot.windows[0].label == "Session"
     assert snapshot.windows[0].used_percent == 15.0

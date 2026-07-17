@@ -37,6 +37,9 @@ class AccountUsageSnapshot:
     fetched_at: datetime
     title: str = "Account limits"
     plan: Optional[str] = None
+    account_email: Optional[str] = None
+    account_label: Optional[str] = None
+    account_id: Optional[str] = None
     windows: tuple[AccountUsageWindow, ...] = ()
     details: tuple[str, ...] = ()
     unavailable_reason: Optional[str] = None
@@ -523,6 +526,11 @@ def _fetch_codex_account_usage(
         response = client.get(_resolve_codex_usage_url(resolved_base_url), headers=headers)
         response.raise_for_status()
     payload = response.json() or {}
+    raw_account = payload.get("account")
+    account: dict[str, Any] = raw_account if isinstance(raw_account, dict) else {}
+    account_email = payload.get("account_email") or account.get("email")
+    account_label = payload.get("account_label") or account.get("label")
+    payload_account_id = payload.get("account_id") or account.get("id")
     rate_limit = payload.get("rate_limit") or {}
     windows: list[AccountUsageWindow] = []
     for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
@@ -558,6 +566,11 @@ def _fetch_codex_account_usage(
         source="usage_api",
         fetched_at=_utc_now(),
         plan=_title_case_slug(payload.get("plan_type")),
+        account_email=str(account_email).strip() if account_email else None,
+        account_label=str(account_label).strip() if account_label else None,
+        account_id=str(payload_account_id or account_id).strip()
+        if (payload_account_id or account_id)
+        else None,
         windows=tuple(windows),
         details=tuple(details),
     )
