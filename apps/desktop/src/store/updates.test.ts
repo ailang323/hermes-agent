@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { DesktopUpdateStatus } from '@/global'
+import type { DesktopUpdateProgress, DesktopUpdateStatus } from '@/global'
 
 const storage = new Map<string, string>()
 
@@ -274,6 +274,67 @@ describe('applyUpdates terminal state', () => {
     delete (globalThis as unknown as { window?: unknown }).window
   })
 
+  it('holds a managed conflict/review candidate as an explicit decision state', async () => {
+    applyMock.mockResolvedValue({
+      ok: true,
+      managed: true,
+      managedStage: 'decision',
+      candidateId: 'candidate-1',
+      decisionKind: 'conflict',
+      conflicts: ['electron/main.ts'],
+      recommendations: [],
+      report: '/tmp/report.json'
+    })
+
+    await applyUpdates()
+
+    expect($updateApply.get()).toMatchObject({
+      applying: false,
+      stage: 'managedDecision',
+      managed: { candidateId: 'candidate-1', decisionKind: 'conflict' }
+    })
+    expect($updateOverlayOpen.get()).toBe(true)
+    expect(notifySpy).not.toHaveBeenCalled()
+  })
+
+  it('holds a verified managed candidate for final user confirmation', async () => {
+    applyMock.mockResolvedValue({
+      ok: true,
+      managed: true,
+      managedStage: 'confirmation',
+      candidateId: 'candidate-2',
+      candidateSha: 'abcdef1',
+      artifactSha256: 'a'.repeat(64),
+      report: '/tmp/verification.json'
+    })
+
+    await applyUpdates()
+
+    expect($updateApply.get()).toMatchObject({
+      applying: false,
+      stage: 'managedConfirmation',
+      managed: { candidateId: 'candidate-2', candidateSha: 'abcdef1' }
+    })
+    expect($updateOverlayOpen.get()).toBe(true)
+    expect(notifySpy).not.toHaveBeenCalled()
+  })
+
+  it('closes the overlay without an error when native managed confirmation is cancelled', async () => {
+    applyMock.mockResolvedValue({
+      ok: false,
+      managed: true,
+      cancelled: true,
+      candidateId: 'candidate-2',
+      message: 'Installation cancelled.'
+    })
+
+    await applyUpdates({ managedAction: 'install', candidateId: 'candidate-2' })
+
+    expect($updateOverlayOpen.get()).toBe(false)
+    expect($updateApply.get()).toMatchObject({ applying: false, stage: 'idle' })
+    expect(notifySpy).not.toHaveBeenCalled()
+  })
+
   it('holds the restart view when a relauncher hands off (no close, no toast)', async () => {
     applyMock.mockResolvedValue({ ok: true, handedOff: true })
 
@@ -380,6 +441,7 @@ describe('applyBackendUpdate recovery', () => {
       percent: null,
       error: null,
       command: null,
+      managed: null,
       log: []
     })
     vi.useFakeTimers()
@@ -464,10 +526,18 @@ describe('startUpdatePoller', () => {
   const onProgressMock = vi.fn()
   const listeners: Record<string, Function> = {}
 
+  let progressHandler: ((payload: DesktopUpdateProgress) => void) | undefined
+
   beforeEach(() => {
     storage.clear()
     checkMock.mockReset()
     onProgressMock.mockReset()
+    progressHandler = undefined
+    onProgressMock.mockImplementation((handler: (payload: DesktopUpdateProgress) => void) => {
+      progressHandler = handler
+
+      return () => undefined
+    })
     Object.keys(listeners).forEach(k => delete listeners[k])
     checkMock.mockResolvedValue({
       supported: true,
@@ -476,6 +546,7 @@ describe('startUpdatePoller', () => {
       fetchedAt: 0
     })
     $updateStatus.set(null)
+    resetUpdateApplyState()
     ;(globalThis as unknown as { window: unknown }).window = {
       hermesDesktop: { updates: { check: checkMock, onProgress: onProgressMock } },
       addEventListener: vi.fn((event: string, handler: Function) => {
@@ -501,6 +572,21 @@ describe('startUpdatePoller', () => {
 
     expect(checkMock).toHaveBeenCalled()
     expect($updateStatus.get()?.behind).toBe(5)
+  })
+
+  it('ignores check progress when no update apply is active', async () => {
+    startUpdatePoller()
+    await vi.advanceTimersByTimeAsync(0)
+
+    progressHandler?.({
+      stage: 'fetch',
+      message: 'Checking managed upstream compatibility...',
+      percent: 10,
+      error: null,
+      at: Date.now()
+    })
+
+    expect($updateApply.get()).toMatchObject({ applying: false, stage: 'idle' })
   })
 
   it('calls checkUpdates() on each interval tick', async () => {

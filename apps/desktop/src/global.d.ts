@@ -321,12 +321,23 @@ export interface DesktopUpdateStatus {
   commits?: DesktopUpdateCommit[]
   dirty?: boolean
   fetchedAt?: number
+  managed?: boolean
+  customCommits?: number
 }
 
 export type DesktopUpdateDirtyStrategy = 'abort' | 'stash' | 'force'
+export type DesktopManagedUpdateAction = 'prepare' | 'accept-review' | 'cancel' | 'install'
 
 export interface DesktopUpdateApplyOptions {
   dirtyStrategy?: DesktopUpdateDirtyStrategy
+  managedAction?: DesktopManagedUpdateAction
+  candidateId?: string
+}
+
+export interface DesktopManagedUpdateRecommendation {
+  feature_id: string
+  kind: string
+  commit_subject: string
 }
 
 export interface DesktopUpdateApplyResult {
@@ -334,6 +345,16 @@ export interface DesktopUpdateApplyResult {
   branch?: string
   error?: string
   message?: string
+  managed?: boolean
+  cancelled?: boolean
+  managedStage?: 'decision' | 'confirmation' | 'installing'
+  candidateId?: string
+  candidateSha?: string
+  artifactSha256?: string
+  decisionKind?: string
+  conflicts?: string[]
+  recommendations?: DesktopManagedUpdateRecommendation[]
+  report?: string
   /** True when no staged updater exists (CLI install) and the user should run
    *  `hermes update` themselves. `command` is the exact line to run. */
   manual?: boolean
@@ -372,6 +393,8 @@ export type DesktopUpdateStage =
   | 'rebuild'
   | 'restart'
   | 'done'
+  | 'managedDecision'
+  | 'managedConfirmation'
   | 'manual'
   /** Backend updated but the running GUI package (AppImage/.deb/.rpm) was NOT
    *  changed — the user must update/reinstall the desktop app. Terminal,

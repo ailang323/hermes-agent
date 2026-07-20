@@ -28,8 +28,22 @@ test('afterPack keeps the packaged macOS node-pty spawn-helper executable', asyn
     fs.mkdirSync(path.dirname(helper), { recursive: true })
     fs.writeFileSync(helper, '#!/bin/sh\nexit 0\n', { mode: 0o644 })
 
-    await afterPack({ appOutDir, electronPlatformName: 'darwin' })
+    let signedBundle = null
+    await afterPack(
+      { appOutDir, electronPlatformName: 'darwin' },
+      {
+        signMacApp(bundle) {
+          assert.notEqual(
+            fs.statSync(helper).mode & 0o111,
+            0,
+            'spawn-helper must be executable before signing'
+          )
+          signedBundle = bundle
+        }
+      }
+    )
 
+    assert.equal(signedBundle, appBundle)
     assert.notEqual(fs.statSync(helper).mode & 0o111, 0, 'spawn-helper must retain an executable bit')
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true })

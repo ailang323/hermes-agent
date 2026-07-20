@@ -1955,6 +1955,24 @@ export const en: Translations = {
     applyingBodyBackend:
       'The remote backend is applying the update and will restart. Hermes reconnects automatically when it’s back.',
     applyingClose: 'This window will close while the update runs, then Hermes reopens on its own.',
+    managedDecisionTitle: 'Update candidate needs review',
+    managedConflictBody:
+      'The isolated candidate has conflicts. Your installed branch and app were not changed. Resolve the listed files before preparing another candidate.',
+    managedReviewBody:
+      'Upstream appears to include one or more local customizations. Review whether the local patch should be removed before continuing.',
+    managedConflictFiles: 'Conflicting files',
+    managedRecommendations: 'Optimization recommendations',
+    managedUpstreamEquivalentRecommendation: 'Use the upstream implementation for this feature.',
+    managedUpstreamEquivalentReason: 'The rebased candidate no longer needs the local patch:',
+    managedReport: 'Detailed report',
+    managedConfirmationTitle: 'Install verified update?',
+    managedConfirmationBody:
+      'This exact candidate passed its configured checks. Confirm the commit and immutable artifact hash before Hermes changes the live branch or app.',
+    managedCandidateCommit: 'Candidate commit',
+    managedArtifactHash: 'Artifact SHA-256',
+    managedInstallVerified: 'Install verified update',
+    managedAcceptRecommendations: 'Use upstream implementation and continue',
+    managedCancel: 'Cancel',
     errorTitle: 'Update didn’t finish',
     errorBody: 'No worries — nothing was lost. You can try again now.',
     notNow: 'Not now',

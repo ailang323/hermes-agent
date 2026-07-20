@@ -29,6 +29,8 @@ export interface UpdateApplyState {
   /** When the stage is 'manual': the exact command the user should run
    *  (CLI install with no staged updater). */
   command: string | null
+  /** Candidate decision/confirmation data. Kept only in memory; never persisted. */
+  managed: DesktopUpdateApplyResult | null
   log: readonly { stage: DesktopUpdateStage; message: string; at: number }[]
 }
 
@@ -39,6 +41,7 @@ const IDLE: UpdateApplyState = {
   percent: null,
   error: null,
   command: null,
+  managed: null,
   log: []
 }
 
@@ -376,6 +379,37 @@ export async function applyUpdates(opts: DesktopUpdateApplyOptions = {}): Promis
   try {
     const result = await bridge.apply(opts)
 
+    if (result?.cancelled) {
+      setUpdateOverlayOpen(false)
+      resetUpdateApplyState()
+
+      return result
+    }
+
+    if (result?.managed && result.managedStage === 'decision') {
+      $updateApply.set({
+        ...IDLE,
+        applying: false,
+        stage: 'managedDecision',
+        message: result.message ?? 'The update candidate needs review.',
+        managed: result
+      })
+
+      return result
+    }
+
+    if (result?.managed && result.managedStage === 'confirmation') {
+      $updateApply.set({
+        ...IDLE,
+        applying: false,
+        stage: 'managedConfirmation',
+        message: result.message ?? 'The verified candidate is ready for final confirmation.',
+        managed: result
+      })
+
+      return result
+    }
+
     // CLI install with no staged updater: not an error — the user just runs
     // `hermes update` themselves. Land on a dedicated manual state so the
     // overlay shows the command + copy button instead of a dead retry loop.
@@ -616,11 +650,18 @@ export async function applyBackendUpdate(): Promise<DesktopUpdateApplyResult> {
 
 function ingestProgress(payload: DesktopUpdateProgress): void {
   const current = $updateApply.get()
+
+  if (!current.applying) {
+    return
+  }
+
   const log = [...current.log, { stage: payload.stage, message: payload.message, at: payload.at }].slice(-50)
 
   const terminal =
     payload.stage === 'error' ||
     payload.stage === 'restart' ||
+    payload.stage === 'managedDecision' ||
+    payload.stage === 'managedConfirmation' ||
     payload.stage === 'manual' ||
     payload.stage === 'guiSkew'
 
@@ -634,6 +675,7 @@ function ingestProgress(payload: DesktopUpdateProgress): void {
     error: payload.error,
     // 'manual' carries the command to run in its message field.
     command: payload.stage === 'manual' ? payload.message : current.command,
+    managed: current.managed,
     log
   })
 }

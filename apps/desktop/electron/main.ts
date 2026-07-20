@@ -108,6 +108,22 @@ import {
 } from './hardening'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
+import {
+  acceptManagedUpdateReview,
+  cancelManagedUpdate,
+  checkManagedUpdates,
+  prepareManagedUpdate,
+  readManagedUpdateConfiguration,
+  recoverManagedUpdates
+} from './managed-update'
+import {
+  buildManagedUpdateConfirmationOptions,
+  ManagedUpdateApprovalVault
+} from './managed-update-approval'
+import {
+  parseManagedUpdateHealthRequest,
+  publishManagedUpdateHealth
+} from './managed-update-health'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
 import { createKeepAwake } from './power-save'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
@@ -937,6 +953,23 @@ function registerMediaProtocol() {
 }
 
 let mainWindow = null
+const managedUpdateHealthRequest = parseManagedUpdateHealthRequest(process.argv)
+let managedUpdateHealthPublished = false
+
+function publishManagedUpdateHealthOnce() {
+  if (!managedUpdateHealthRequest || managedUpdateHealthPublished) {
+    return
+  }
+
+  try {
+    publishManagedUpdateHealth(managedUpdateHealthRequest)
+    managedUpdateHealthPublished = true
+    rememberLog('Published nonce-bound managed-update startup readiness')
+  } catch (error) {
+    rememberLog(`Failed to publish managed-update startup readiness: ${error.message}`)
+  }
+}
+
 const backendConnectionState = createBackendConnectionState<ReturnType<typeof spawn>, any>()
 const remoteLiveness = new RemoteLivenessTracker()
 const remoteRevalidation = new RemoteRevalidationCoordinator()
@@ -2202,7 +2235,38 @@ async function resolveHealedBranch(updateRoot, branch) {
   return 'main'
 }
 
+async function recoverManagedUpdateOnStartup() {
+  const configuration = readManagedUpdateConfiguration(HERMES_HOME)
+
+  if (!configuration) {
+    return false
+  }
+
+  const result = await recoverManagedUpdates(configuration)
+
+  if (result.recovered > 0) {
+    rememberLog(`Recovered ${result.recovered} interrupted managed update transaction(s).`)
+
+    return true
+  }
+
+  return false
+}
+
 async function checkUpdates() {
+  const managedConfiguration = readManagedUpdateConfiguration(HERMES_HOME)
+
+  if (managedConfiguration) {
+    const result = await checkManagedUpdates(managedConfiguration)
+
+    return {
+      ...result,
+      commits: [],
+      hermesRoot: managedConfiguration.worktree,
+      fetchedAt: Date.now()
+    }
+  }
+
   const updateRoot = resolveUpdateRoot()
   let { branch } = readDesktopUpdateConfig()
   const gitDir = path.join(updateRoot, '.git')
@@ -2570,6 +2634,160 @@ async function releaseBackendLock(updateRoot, tag) {
 
 // applyUpdates — hand off to the installer's --update flow, then exit.
 //
+// Managed patch-stack installs use a stricter two-step route: prepare and
+// verify an isolated candidate first, retain its capability in the main process,
+// then require a native confirmation before that one-time capability can change
+// the live branch or app bundle.
+const managedUpdateApprovals = new ManagedUpdateApprovalVault()
+
+function retainManagedApproval(result) {
+  return result?.managedStage === 'confirmation' ? managedUpdateApprovals.retain(result) : result
+}
+
+async function cancelManagedCandidate(configuration, candidateId) {
+  managedUpdateApprovals.revoke(candidateId)
+
+  return await cancelManagedUpdate(configuration, candidateId)
+}
+
+async function applyManagedUpdate(configuration, opts) {
+  const action = opts?.managedAction || 'prepare'
+
+  if (action === 'cancel') {
+    const candidateId = typeof opts?.candidateId === 'string' ? opts.candidateId : ''
+
+    return await cancelManagedCandidate(configuration, candidateId)
+  }
+
+  if (action === 'prepare') {
+    const candidateId = `desktop-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`
+
+    emitUpdateProgress({ stage: 'prepare', message: '', percent: 5 })
+    const result = await prepareManagedUpdate(configuration, candidateId)
+
+    emitUpdateProgress({
+      stage: result.managedStage === 'decision' ? 'managedDecision' : 'managedConfirmation',
+      message: '',
+      percent: 100
+    })
+
+    return retainManagedApproval(result)
+  }
+
+  if (action === 'accept-review') {
+    const candidateId = typeof opts?.candidateId === 'string' ? opts.candidateId : ''
+
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(candidateId)) {
+      throw new Error('Managed update candidate ID is invalid.')
+    }
+
+    emitUpdateProgress({ stage: 'rebuild', message: '', percent: 65 })
+    const result = await acceptManagedUpdateReview(configuration, candidateId)
+    emitUpdateProgress({
+      stage: 'managedConfirmation',
+      message: '',
+      percent: 100
+    })
+
+    return retainManagedApproval(result)
+  }
+
+  if (action !== 'install') {
+    throw new Error(`Unsupported managed update action: ${String(action)}`)
+  }
+
+  const candidateId = typeof opts?.candidateId === 'string' ? opts.candidateId : ''
+
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(candidateId)) {
+    throw new Error('Managed update candidate ID is invalid.')
+  }
+
+  const approval = await managedUpdateApprovals.authorize(candidateId, async summary => {
+    const options = buildManagedUpdateConfirmationOptions(summary, app.getLocale())
+    const parent = BrowserWindow.getFocusedWindow() || mainWindow
+    const result = parent ? await dialog.showMessageBox(parent, options) : await dialog.showMessageBox(options)
+
+    return result.response === 1
+  })
+
+  if (!approval) {
+    return await cancelManagedCandidate(configuration, candidateId)
+  }
+
+  const confirmationToken = approval.confirmationToken
+
+  emitUpdateProgress({ stage: 'restart', message: '', percent: 100 })
+  const lock = await releaseBackendLockForUpdate(configuration.worktree)
+
+  if (!lock.unlocked) {
+    await cancelManagedCandidate(configuration, candidateId)
+
+    return {
+      ok: false,
+      managed: true,
+      error: 'install-locked',
+      message: 'Another process is holding the Hermes environment open. Close it, then prepare and verify a new candidate.'
+    }
+  }
+
+  const child = spawn(
+    configuration.pythonPath,
+    [
+      configuration.coordinatorPath,
+      '--manifest',
+      configuration.manifestPath,
+      'install',
+      '--state-root',
+      configuration.stateRoot,
+      '--candidate-id',
+      candidateId,
+      '--confirmation-token',
+      confirmationToken,
+      '--wait-pid',
+      String(process.pid)
+    ],
+    {
+      cwd: HERMES_HOME,
+      env: { ...process.env, HERMES_HOME },
+      detached: true,
+      shell: false,
+      stdio: 'ignore'
+    }
+  )
+
+  try {
+    await new Promise((resolve, reject) => {
+      child.once('spawn', resolve)
+      child.once('error', reject)
+    })
+  } catch (error) {
+    await cancelManagedCandidate(configuration, candidateId)
+    const detail = error instanceof Error ? error.message : String(error)
+    throw new Error(`Managed update installer did not start; the candidate was invalidated: ${detail}`)
+  }
+
+  if (!Number.isInteger(child.pid)) {
+    await cancelManagedCandidate(configuration, candidateId)
+    throw new Error('Managed update installer did not start; the candidate was invalidated.')
+  }
+
+  child.unref()
+  writeUpdateMarker(HERMES_HOME, child.pid)
+  isQuittingForHandoff = true
+  setTimeout(() => app.quit(), UPDATE_HANDOFF_DWELL_MS)
+
+  return {
+    ok: true,
+    managed: true,
+    managedStage: 'installing',
+    handedOff: true,
+    candidateId,
+    updater: configuration.coordinatorPath
+  }
+}
+
+// applyUpdates — hand off to the installer's --update flow, then exit.
+//
 // The desktop is a pure consumer: it does NOT git pull / pip install / rebuild
 // itself (the old open-coded git dance lived here and drifted from
 // `hermes update`). Instead we spawn the staged Hermes-Setup binary with
@@ -2586,6 +2804,12 @@ async function applyUpdates(opts = {}) {
   updateInFlight = true
 
   try {
+    const managedConfiguration = readManagedUpdateConfiguration(HERMES_HOME)
+
+    if (managedConfiguration) {
+      return await applyManagedUpdate(managedConfiguration, opts)
+    }
+
     const updater = resolveUpdaterBinary()
 
     if (!updater && !IS_WINDOWS) {
@@ -7845,7 +8069,12 @@ function createWindow() {
   })
 }
 
-ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(profile))
+ipcMain.handle('hermes:connection', async (_event, profile) => {
+  const connection = await ensureBackend(profile)
+  publishManagedUpdateHealthOnce()
+
+  return connection
+})
 // Reconnect-after-wake recovery. A REMOTE primary backend has no child process,
 // so the 'exit'/'error' handlers that would clear a dead connection promise never
 // fire — once the remote becomes unreachable across a sleep/wake the renderer
@@ -9739,7 +9968,26 @@ app.on('open-url', (event, url) => {
   handleDeepLink(url)
 })
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  try {
+    if (await recoverManagedUpdateOnStartup()) {
+      app.relaunch()
+      app.exit(0)
+
+      return
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    rememberLog(`Managed update recovery failed: ${detail}`)
+    dialog.showErrorBox(
+      'Hermes update recovery failed',
+      `Hermes found an interrupted managed update but could not restore it safely.\n\n${detail}`
+    )
+    app.exit(1)
+
+    return
+  }
+
   const systemCa = installWindowsSystemCaTrust(tls)
 
   if (systemCa.applied) {

@@ -23,6 +23,7 @@
  *   - packager.appInfo.productFilename: the exe basename (e.g. 'Hermes')
  */
 
+import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 
@@ -60,10 +61,39 @@ function makePackagedSpawnHelpersExecutable(appOutDir, productName) {
   }
 }
 
-export default async function afterPack(context) {
+export function signMacApp(appBundle) {
+  const sign = spawnSync(
+    '/usr/bin/codesign',
+    ['--force', '--deep', '--sign', '-', '--timestamp=none', appBundle],
+    { encoding: 'utf8' }
+  )
+
+  if (sign.error || sign.status !== 0) {
+    const detail =
+      sign.error?.message || sign.stderr?.trim() || sign.stdout?.trim() || `exit ${sign.status}`
+    throw new Error(`[after-pack] ad-hoc signing failed for ${appBundle}: ${detail}`)
+  }
+
+  const verify = spawnSync(
+    '/usr/bin/codesign',
+    ['--verify', '--deep', '--strict', '--verbose=2', appBundle],
+    { encoding: 'utf8' }
+  )
+
+  if (verify.error || verify.status !== 0) {
+    const detail =
+      verify.error?.message || verify.stderr?.trim() || verify.stdout?.trim() || `exit ${verify.status}`
+    throw new Error(`[after-pack] strict signature verification failed for ${appBundle}: ${detail}`)
+  }
+}
+
+export default async function afterPack(context, dependencies = {}) {
   if (context.electronPlatformName === 'darwin') {
     const productName = context.packager?.appInfo?.productFilename || 'Hermes'
+    const appBundle = path.join(context.appOutDir, `${productName}.app`)
     makePackagedSpawnHelpersExecutable(context.appOutDir, productName)
+    const signer = dependencies.signMacApp || signMacApp
+    signer(appBundle)
     return
   }
 

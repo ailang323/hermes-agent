@@ -1614,6 +1614,21 @@ export interface Translations {
     applyingBody: string
     applyingBodyBackend: string
     applyingClose: string
+    managedDecisionTitle: string
+    managedConflictBody: string
+    managedReviewBody: string
+    managedConflictFiles: string
+    managedRecommendations: string
+    managedUpstreamEquivalentRecommendation: string
+    managedUpstreamEquivalentReason: string
+    managedReport: string
+    managedConfirmationTitle: string
+    managedConfirmationBody: string
+    managedCandidateCommit: string
+    managedArtifactHash: string
+    managedInstallVerified: string
+    managedAcceptRecommendations: string
+    managedCancel: string
     errorTitle: string
     errorBody: string
     notNow: string

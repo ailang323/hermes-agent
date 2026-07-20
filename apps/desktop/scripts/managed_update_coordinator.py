@@ -1,0 +1,1810 @@
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import ctypes
+from dataclasses import dataclass, replace
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import plistlib
+import re
+import secrets
+import shutil
+import subprocess
+import tempfile
+import time
+from typing import Any, Callable
+
+
+SUPPORTED_SCHEMA = 1
+SUPPORTED_MODE = 'managed-patch-stack'
+
+
+class ManifestError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class ManagedFeature:
+    id: str
+    commit_subject: str
+
+
+@dataclass(frozen=True)
+class VerificationCommand:
+    name: str
+    argv: tuple[str, ...]
+    cwd: str
+
+
+@dataclass(frozen=True)
+class ManagedUpdateManifest:
+    schema: int
+    mode: str
+    worktree: Path
+    branch: str
+    upstream: str
+    installed_app: Path
+    features: tuple[ManagedFeature, ...]
+    verification_commands: tuple[VerificationCommand, ...]
+    artifact: str | None
+
+
+@dataclass(frozen=True)
+class CommitIdentity:
+    sha: str
+    subject: str
+    patch_id: str
+
+
+@dataclass(frozen=True)
+class RepositoryStatus:
+    current_branch: str
+    original_sha: str
+    upstream_sha: str
+    ahead: int
+    behind: int
+    clean: bool
+    custom_commit_subjects: tuple[str, ...]
+    custom_commits: tuple[CommitIdentity, ...] = ()
+
+
+@dataclass(frozen=True)
+class OptimizationRecommendation:
+    feature_id: str
+    kind: str
+    commit_subject: str
+
+
+@dataclass(frozen=True)
+class CandidateResult:
+    candidate_id: str
+    state_dir: Path
+    worktree: Path
+    status: str
+    original_sha: str
+    upstream_sha: str
+    candidate_sha: str
+    conflicts: tuple[str, ...]
+    original_commit_subjects: tuple[str, ...]
+    candidate_commit_subjects: tuple[str, ...]
+    recommendations: tuple[OptimizationRecommendation, ...]
+    original_commits: tuple[CommitIdentity, ...] = ()
+    candidate_commits: tuple[CommitIdentity, ...] = ()
+
+
+@dataclass(frozen=True)
+class VerificationCommandResult:
+    name: str
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+@dataclass(frozen=True)
+class VerifiedCandidate:
+    candidate_id: str
+    status: str
+    artifact: Path
+    artifact_sha256: str
+    manifest_sha256: str
+    decision_sha256: str | None
+    commands: tuple[VerificationCommandResult, ...]
+
+
+@dataclass(frozen=True)
+class InstallResult:
+    candidate_id: str
+    status: str
+    safety_ref: str
+    backup_path: Path
+
+
+def _required_string(data: dict[str, Any], key: str) -> str:
+    value = data.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ManifestError(f'{key} must be a non-empty string')
+    return value.strip()
+
+
+def _required_git_ref(data: dict[str, Any], key: str) -> str:
+    value = _required_string(data, key)
+    if value.startswith('-'):
+        raise ManifestError(f'{key} must be a valid Git ref')
+    checked = subprocess.run(
+        ['git', 'check-ref-format', '--branch', value],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if checked.returncode != 0:
+        raise ManifestError(f'{key} must be a valid Git ref')
+    return value
+
+
+def load_manifest(path: Path) -> ManagedUpdateManifest:
+    try:
+        raw = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ManifestError(f'cannot read managed update manifest: {error}') from error
+
+    if not isinstance(raw, dict):
+        raise ManifestError('manifest root must be an object')
+    if raw.get('schema') != SUPPORTED_SCHEMA:
+        raise ManifestError(f'manifest schema must be {SUPPORTED_SCHEMA}')
+    if raw.get('mode') != SUPPORTED_MODE:
+        raise ManifestError(f'manifest mode must be {SUPPORTED_MODE}')
+
+    feature_rows = raw.get('features', [])
+    if not isinstance(feature_rows, list):
+        raise ManifestError('features must be an array')
+
+    features: list[ManagedFeature] = []
+    for row in feature_rows:
+        if not isinstance(row, dict):
+            raise ManifestError('each feature must be an object')
+        features.append(
+            ManagedFeature(
+                id=_required_string(row, 'id'),
+                commit_subject=_required_string(row, 'commit_subject'),
+            )
+        )
+
+    verification_rows = raw.get('verification_commands', [])
+    if not isinstance(verification_rows, list):
+        raise ManifestError('verification_commands must be an array')
+    verification_commands: list[VerificationCommand] = []
+    for row in verification_rows:
+        if not isinstance(row, dict):
+            raise ManifestError('each verification command must be an object')
+        argv = row.get('argv')
+        if (
+            not isinstance(argv, list)
+            or not argv
+            or any(not isinstance(value, str) or not value for value in argv)
+        ):
+            raise ManifestError('verification command argv must be a non-empty string array')
+        cwd = row.get('cwd', '.')
+        if not isinstance(cwd, str) or not cwd:
+            raise ManifestError('verification command cwd must be a non-empty string')
+        verification_commands.append(
+            VerificationCommand(
+                name=_required_string(row, 'name'),
+                argv=tuple(argv),
+                cwd=cwd,
+            )
+        )
+
+    artifact = raw.get('artifact')
+    if artifact is not None and (not isinstance(artifact, str) or not artifact):
+        raise ManifestError('artifact must be a non-empty string when configured')
+
+    return ManagedUpdateManifest(
+        schema=SUPPORTED_SCHEMA,
+        mode=SUPPORTED_MODE,
+        worktree=Path(_required_string(raw, 'worktree')).expanduser().resolve(),
+        branch=_required_git_ref(raw, 'branch'),
+        upstream=_required_git_ref(raw, 'upstream'),
+        installed_app=Path(_required_string(raw, 'installed_app')).expanduser().resolve(),
+        features=tuple(features),
+        verification_commands=tuple(verification_commands),
+        artifact=artifact,
+    )
+
+
+def manifest_digest(manifest: ManagedUpdateManifest) -> str:
+    payload = {
+        'schema': manifest.schema,
+        'mode': manifest.mode,
+        'worktree': str(manifest.worktree),
+        'branch': manifest.branch,
+        'upstream': manifest.upstream,
+        'installed_app': str(manifest.installed_app),
+        'features': [
+            {'id': feature.id, 'commit_subject': feature.commit_subject}
+            for feature in manifest.features
+        ],
+        'verification_commands': [
+            {'name': command.name, 'argv': list(command.argv), 'cwd': command.cwd}
+            for command in manifest.verification_commands
+        ],
+        'artifact': manifest.artifact,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _run_git(worktree: Path, *args: str) -> str:
+    result = subprocess.run(
+        ['git', *args],
+        cwd=worktree,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f'exit {result.returncode}'
+        raise ManifestError(f"git {' '.join(args)} failed: {detail}")
+    return result.stdout.strip()
+
+
+def _commit_patch_id(worktree: Path, commit_sha: str) -> str:
+    patch = subprocess.run(
+        ['git', 'show', '--pretty=format:', '--binary', commit_sha],
+        cwd=worktree,
+        check=False,
+        capture_output=True,
+    )
+    if patch.returncode != 0:
+        detail = patch.stderr.decode('utf-8', errors='replace').strip() or f'exit {patch.returncode}'
+        raise ManifestError(f'cannot render patch for commit {commit_sha}: {detail}')
+    identified = subprocess.run(
+        ['git', 'patch-id', '--stable'],
+        cwd=worktree,
+        input=patch.stdout,
+        check=False,
+        capture_output=True,
+    )
+    if identified.returncode != 0:
+        detail = identified.stderr.decode('utf-8', errors='replace').strip() or f'exit {identified.returncode}'
+        raise ManifestError(f'cannot calculate patch-id for commit {commit_sha}: {detail}')
+    fields = identified.stdout.decode('ascii', errors='strict').strip().split()
+    if not fields:
+        return ''
+    patch_id = fields[0]
+    if not re.fullmatch(r'[0-9a-f]{40,64}', patch_id):
+        raise ManifestError(f'git returned an invalid patch-id for commit {commit_sha}')
+    return patch_id
+
+
+def _commit_identities(worktree: Path, base_sha: str, head_sha: str) -> tuple[CommitIdentity, ...]:
+    commits_raw = _run_git(worktree, 'rev-list', '--reverse', f'{base_sha}..{head_sha}')
+    commits: list[CommitIdentity] = []
+    for commit_sha in commits_raw.splitlines():
+        if not re.fullmatch(r'[0-9a-f]{40}', commit_sha):
+            raise ManifestError('git returned an invalid commit identity')
+        commits.append(
+            CommitIdentity(
+                sha=commit_sha,
+                subject=_run_git(worktree, 'show', '-s', '--format=%s', commit_sha),
+                patch_id=_commit_patch_id(worktree, commit_sha),
+            )
+        )
+    return tuple(commits)
+
+
+def _upstream_equivalent_commit_shas(
+    worktree: Path,
+    upstream_sha: str,
+    original_sha: str,
+) -> frozenset[str]:
+    cherry = _run_git(worktree, 'cherry', upstream_sha, original_sha)
+    equivalent: set[str] = set()
+    for line in cherry.splitlines():
+        fields = line.split()
+        if (
+            len(fields) != 2
+            or fields[0] not in {'+', '-'}
+            or not re.fullmatch(r'[0-9a-f]{40}', fields[1])
+        ):
+            raise ManifestError('git cherry returned malformed patch identity output')
+        if fields[0] == '-':
+            equivalent.add(fields[1])
+    return frozenset(equivalent)
+
+
+def inspect_repository(manifest: ManagedUpdateManifest) -> RepositoryStatus:
+    current_branch = _run_git(manifest.worktree, 'branch', '--show-current')
+    original_sha = _run_git(manifest.worktree, 'rev-parse', 'HEAD^{commit}')
+    upstream_sha = _run_git(manifest.worktree, 'rev-parse', f'{manifest.upstream}^{{commit}}')
+    ahead = int(_run_git(manifest.worktree, 'rev-list', '--count', f'{manifest.upstream}..HEAD'))
+    behind = int(_run_git(manifest.worktree, 'rev-list', '--count', f'HEAD..{manifest.upstream}'))
+    status = _run_git(manifest.worktree, 'status', '--porcelain=v1', '--untracked-files=normal')
+    commits = _commit_identities(manifest.worktree, upstream_sha, original_sha)
+
+    return RepositoryStatus(
+        current_branch=current_branch,
+        original_sha=original_sha,
+        upstream_sha=upstream_sha,
+        ahead=ahead,
+        behind=behind,
+        clean=not status,
+        custom_commit_subjects=tuple(commit.subject for commit in commits),
+        custom_commits=commits,
+    )
+
+
+def _write_immutable_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_name(f'.{path.name}.{os.getpid()}.{time.time_ns()}.tmp')
+    encoded = (json.dumps(payload, indent=2, sort_keys=True) + '\n').encode('utf-8')
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, 'wb') as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.chmod(0o444)
+        try:
+            os.link(temporary, path)
+        except FileExistsError as error:
+            raise ManifestError(f'immutable report already exists: {path}') from error
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_candidate_report(result: CandidateResult) -> None:
+    payload = {
+        'schema': 1,
+        'candidate_id': result.candidate_id,
+        'status': result.status,
+        'state_dir': str(result.state_dir),
+        'worktree': str(result.worktree),
+        'original_sha': result.original_sha,
+        'upstream_sha': result.upstream_sha,
+        'candidate_sha': result.candidate_sha,
+        'conflicts': list(result.conflicts),
+        'original_commit_subjects': list(result.original_commit_subjects),
+        'candidate_commit_subjects': list(result.candidate_commit_subjects),
+        'original_commits': [
+            {'sha': item.sha, 'subject': item.subject, 'patch_id': item.patch_id}
+            for item in result.original_commits
+        ],
+        'candidate_commits': [
+            {'sha': item.sha, 'subject': item.subject, 'patch_id': item.patch_id}
+            for item in result.candidate_commits
+        ],
+        'recommendations': [
+            {
+                'feature_id': item.feature_id,
+                'kind': item.kind,
+                'commit_subject': item.commit_subject,
+            }
+            for item in result.recommendations
+        ],
+    }
+    _write_immutable_json(result.state_dir / 'report.json', payload)
+
+
+def prepare_candidate(
+    manifest: ManagedUpdateManifest,
+    state_root: Path,
+    *,
+    candidate_id: str,
+) -> CandidateResult:
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', candidate_id):
+        raise ManifestError('candidate_id contains unsupported characters')
+
+    repository = inspect_repository(manifest)
+    if repository.current_branch != manifest.branch:
+        raise ManifestError(
+            f'active branch is {repository.current_branch!r}, expected {manifest.branch!r}'
+        )
+    if not repository.clean:
+        raise ManifestError('active worktree must be clean before preparing an update')
+
+    state_dir = state_root.expanduser().resolve() / candidate_id
+    candidate_worktree = state_dir / 'worktree'
+    state_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+    state_dir.chmod(0o700)
+    _run_git(
+        manifest.worktree,
+        'worktree',
+        'add',
+        '--detach',
+        str(candidate_worktree),
+        repository.original_sha,
+    )
+
+    rebase = subprocess.run(
+        ['git', 'rebase', '--reapply-cherry-picks', repository.upstream_sha],
+        cwd=candidate_worktree,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            'GIT_EDITOR': 'true',
+            'GIT_SEQUENCE_EDITOR': 'true',
+        },
+    )
+    conflicts_raw = _run_git(
+        candidate_worktree,
+        'diff',
+        '--name-only',
+        '--diff-filter=U',
+    )
+    conflicts = tuple(line for line in conflicts_raw.splitlines() if line)
+    if rebase.returncode != 0 and not conflicts:
+        detail = rebase.stderr.strip() or rebase.stdout.strip() or f'exit {rebase.returncode}'
+        raise ManifestError(f'candidate rebase failed: {detail}')
+
+    candidate_sha = _run_git(candidate_worktree, 'rev-parse', 'HEAD^{commit}')
+    _run_git(
+        candidate_worktree,
+        'merge-base',
+        '--is-ancestor',
+        repository.upstream_sha,
+        candidate_sha,
+    )
+    candidate_commits = _commit_identities(
+        candidate_worktree,
+        repository.upstream_sha,
+        candidate_sha,
+    )
+    candidate_subjects = tuple(item.subject for item in candidate_commits)
+    recommendations: list[OptimizationRecommendation] = []
+    preservation_conflicts: list[str] = []
+    if not conflicts:
+        remaining_patch_ids: dict[str, int] = {}
+        for item in candidate_commits:
+            if item.patch_id:
+                remaining_patch_ids[item.patch_id] = remaining_patch_ids.get(item.patch_id, 0) + 1
+        upstream_equivalents = _upstream_equivalent_commit_shas(
+            manifest.worktree,
+            repository.upstream_sha,
+            repository.original_sha,
+        )
+        feature_ids_by_subject: dict[str, list[str]] = {}
+        for feature in manifest.features:
+            feature_ids_by_subject.setdefault(feature.commit_subject, []).append(feature.id)
+
+        for item in repository.custom_commits:
+            if item.patch_id and remaining_patch_ids.get(item.patch_id, 0) > 0:
+                remaining_patch_ids[item.patch_id] -= 1
+                continue
+            feature_ids = feature_ids_by_subject.get(item.subject, [])
+            feature_id = feature_ids[0] if feature_ids else f'commit-{item.sha[:12]}'
+            if item.sha in upstream_equivalents:
+                recommendations.append(
+                    OptimizationRecommendation(
+                        feature_id=feature_id,
+                        kind='upstream-equivalent',
+                        commit_subject=item.subject,
+                    )
+                )
+                continue
+            preservation_conflicts.append(
+                f'custom commit {item.sha[:12]} ({item.subject}) is not patch-equivalent '
+                'to the candidate or captured upstream'
+            )
+
+    all_conflicts = (*conflicts, *preservation_conflicts)
+    recommendation_tuple = tuple(recommendations)
+    status = 'conflict' if all_conflicts else ('review' if recommendation_tuple else 'ready')
+    result = CandidateResult(
+        candidate_id=candidate_id,
+        state_dir=state_dir,
+        worktree=candidate_worktree,
+        status=status,
+        original_sha=repository.original_sha,
+        upstream_sha=repository.upstream_sha,
+        candidate_sha=candidate_sha,
+        conflicts=all_conflicts,
+        original_commit_subjects=repository.custom_commit_subjects,
+        candidate_commit_subjects=candidate_subjects,
+        recommendations=recommendation_tuple,
+        original_commits=repository.custom_commits,
+        candidate_commits=candidate_commits,
+    )
+    _write_candidate_report(result)
+    return result
+
+
+def _candidate_path(root: Path, relative: str, *, must_exist: bool) -> Path:
+    value = Path(relative)
+    if value.is_absolute():
+        raise ManifestError('candidate-relative paths must not be absolute')
+    resolved_root = root.resolve()
+    resolved = (resolved_root / value).resolve(strict=must_exist)
+    if resolved != resolved_root and resolved_root not in resolved.parents:
+        raise ManifestError(f'candidate path escapes worktree: {relative}')
+    return resolved
+
+
+def _hash_field(digest: 'hashlib._Hash', value: bytes) -> None:
+    digest.update(len(value).to_bytes(8, 'big'))
+    digest.update(value)
+
+
+def _hash_artifact(path: Path) -> str:
+    if path.is_file():
+        digest = hashlib.sha256()
+        with path.open('rb') as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    if not path.is_dir():
+        raise ManifestError(f'artifact is neither a file nor a directory: {path}')
+
+    root = path.resolve(strict=True)
+    digest = hashlib.sha256()
+    digest.update(b'HERMES-ARTIFACT-TREE\0v1\0')
+    for child in sorted(path.rglob('*'), key=lambda item: item.relative_to(path).as_posix()):
+        relative = child.relative_to(path).as_posix().encode('utf-8')
+        stat = child.lstat()
+        _hash_field(digest, relative)
+        if child.is_symlink():
+            target_text = os.readlink(child)
+            if Path(target_text).is_absolute():
+                raise ManifestError(f'artifact symlink escapes relocatable bundle: {child}')
+            try:
+                resolved_target = child.resolve(strict=True)
+            except (OSError, RuntimeError) as error:
+                raise ManifestError(f'artifact symlink is invalid: {child}: {error}') from error
+            if resolved_target != root and root not in resolved_target.parents:
+                raise ManifestError(f'artifact symlink escapes bundle: {child}')
+            digest.update(b'L')
+            _hash_field(digest, target_text.encode('utf-8'))
+        elif child.is_file():
+            digest.update(b'F')
+            digest.update((stat.st_mode & 0o777).to_bytes(4, 'big'))
+            digest.update(stat.st_size.to_bytes(8, 'big'))
+            with child.open('rb') as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                    digest.update(chunk)
+        elif child.is_dir():
+            digest.update(b'D')
+            digest.update((stat.st_mode & 0o777).to_bytes(4, 'big'))
+        else:
+            raise ManifestError(f'artifact contains an unsupported file type: {child}')
+    return digest.hexdigest()
+
+
+def _verify_candidate_worktree_identity(
+    manifest: ManagedUpdateManifest,
+    candidate: CandidateResult,
+    phase: str,
+) -> None:
+    expected_worktree = candidate.worktree.resolve(strict=True)
+    top_level = Path(_run_git(candidate.worktree, 'rev-parse', '--show-toplevel')).resolve(strict=True)
+    if top_level != expected_worktree:
+        raise ManifestError(f'candidate worktree identity changed before {phase}')
+    candidate_common = Path(
+        _run_git(candidate.worktree, 'rev-parse', '--path-format=absolute', '--git-common-dir')
+    ).resolve(strict=True)
+    active_common = Path(
+        _run_git(manifest.worktree, 'rev-parse', '--path-format=absolute', '--git-common-dir')
+    ).resolve(strict=True)
+    if candidate_common != active_common:
+        raise ManifestError(f'candidate worktree belongs to a different repository before {phase}')
+
+
+def _verify_candidate_source(
+    manifest: ManagedUpdateManifest,
+    candidate: CandidateResult,
+    phase: str,
+) -> None:
+    if not re.fullmatch(r'[0-9a-f]{40}', candidate.candidate_sha):
+        raise ManifestError('candidate SHA must be a full 40-character hexadecimal SHA')
+    _verify_candidate_worktree_identity(manifest, candidate, phase)
+    head = _run_git(candidate.worktree, 'rev-parse', 'HEAD^{commit}')
+    if head != candidate.candidate_sha:
+        raise ManifestError(f'candidate HEAD changed before {phase}')
+    tracked_status = _run_git(
+        candidate.worktree,
+        'status',
+        '--porcelain=v1',
+        '--untracked-files=no',
+        '--ignore-submodules=none',
+    )
+    if tracked_status:
+        raise ManifestError(f'candidate tracked or index state is dirty before {phase}')
+    current_candidate_commits = _commit_identities(
+        candidate.worktree,
+        candidate.upstream_sha,
+        candidate.candidate_sha,
+    )
+    if current_candidate_commits != candidate.candidate_commits:
+        raise ManifestError(f'candidate patch identities changed before {phase}')
+    current_original_commits = _commit_identities(
+        manifest.worktree,
+        candidate.upstream_sha,
+        candidate.original_sha,
+    )
+    if current_original_commits != candidate.original_commits:
+        raise ManifestError(f'original patch identities changed before {phase}')
+
+
+def _review_decision_digest(candidate: CandidateResult) -> str | None:
+    if not candidate.recommendations:
+        return None
+    decision = _read_json_object(candidate.state_dir / 'decision.json')
+    if decision.get('schema') != 1:
+        raise ManifestError('unsupported review decision schema')
+    if _required_string(decision, 'candidate_id') != candidate.candidate_id:
+        raise ManifestError('review decision candidate_id does not match candidate')
+    if decision.get('decision') != 'accept-upstream-equivalents':
+        raise ManifestError('review decision is not an accepted upstream-equivalent decision')
+    expected_features = [item.feature_id for item in candidate.recommendations]
+    if decision.get('features') != expected_features:
+        raise ManifestError('review decision features do not match candidate recommendations')
+    encoded = json.dumps(decision, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def verify_candidate(
+    manifest: ManagedUpdateManifest,
+    candidate: CandidateResult,
+) -> VerifiedCandidate:
+    if candidate.status != 'ready':
+        raise ManifestError(f'candidate status must be ready, got {candidate.status!r}')
+    if not manifest.artifact:
+        raise ManifestError('manifest does not configure an artifact')
+    _verify_candidate_source(manifest, candidate, 'verification')
+    decision_sha256 = _review_decision_digest(candidate)
+
+    command_results: list[VerificationCommandResult] = []
+    for command in manifest.verification_commands:
+        cwd = _candidate_path(candidate.worktree, command.cwd, must_exist=True)
+        if not cwd.is_dir():
+            raise ManifestError(f'verification cwd is not a directory: {command.cwd}')
+        completed = subprocess.run(
+            list(command.argv),
+            cwd=cwd,
+            check=False,
+            capture_output=True,
+            text=True,
+            env={**os.environ, 'CI': '1'},
+        )
+        result = VerificationCommandResult(
+            name=command.name,
+            returncode=completed.returncode,
+            stdout=completed.stdout[-20000:],
+            stderr=completed.stderr[-20000:],
+        )
+        command_results.append(result)
+        if completed.returncode != 0:
+            raise ManifestError(
+                f'verification command {command.name!r} failed with exit {completed.returncode}'
+            )
+
+    _verify_candidate_source(manifest, candidate, 'artifact hashing')
+    artifact = _candidate_path(candidate.worktree, manifest.artifact, must_exist=True)
+    verified = VerifiedCandidate(
+        candidate_id=candidate.candidate_id,
+        status='verified',
+        artifact=artifact,
+        artifact_sha256=_hash_artifact(artifact),
+        manifest_sha256=manifest_digest(manifest),
+        decision_sha256=decision_sha256,
+        commands=tuple(command_results),
+    )
+    report = {
+        'schema': 1,
+        'candidate_id': verified.candidate_id,
+        'candidate_sha': candidate.candidate_sha,
+        'status': verified.status,
+        'artifact': str(verified.artifact),
+        'artifact_sha256': verified.artifact_sha256,
+        'manifest_sha256': verified.manifest_sha256,
+        'decision_sha256': verified.decision_sha256,
+        'commands': [
+            {
+                'name': item.name,
+                'returncode': item.returncode,
+                'stdout': item.stdout,
+                'stderr': item.stderr,
+            }
+            for item in verified.commands
+        ],
+    }
+    _write_immutable_json(candidate.state_dir / 'verification.json', report)
+    return verified
+
+
+def accept_candidate_review(
+    manifest: ManagedUpdateManifest,
+    candidate: CandidateResult,
+) -> VerifiedCandidate:
+    if candidate.status != 'review':
+        raise ManifestError(f'candidate status must be review, got {candidate.status!r}')
+    if not candidate.recommendations:
+        raise ManifestError('review candidate has no optimization recommendations')
+
+    decision = {
+        'schema': 1,
+        'candidate_id': candidate.candidate_id,
+        'decision': 'accept-upstream-equivalents',
+        'features': [item.feature_id for item in candidate.recommendations],
+        'accepted_at': int(time.time()),
+    }
+    _write_immutable_json(candidate.state_dir / 'decision.json', decision)
+
+    ready = replace(candidate, status='ready')
+    return verify_candidate(manifest, ready)
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ManifestError(f'cannot read report {path}: {error}') from error
+    if not isinstance(value, dict):
+        raise ManifestError(f'report must contain a JSON object: {path}')
+    return value
+
+
+def _report_string_list(value: Any, field: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ManifestError(f'report field {field!r} must be a string array')
+    return tuple(value)
+
+
+def _report_sha(report: dict[str, Any], field: str) -> str:
+    value = _required_string(report, field)
+    if not re.fullmatch(r'[0-9a-f]{40}', value):
+        raise ManifestError(f'report field {field!r} must be a full 40-character SHA')
+    return value
+
+
+def _report_commit_identities(value: Any, field: str) -> tuple[CommitIdentity, ...]:
+    if not isinstance(value, list):
+        raise ManifestError(f'report field {field!r} must be a commit identity array')
+    identities: list[CommitIdentity] = []
+    for row in value:
+        if not isinstance(row, dict):
+            raise ManifestError(f'report field {field!r} contains a non-object commit identity')
+        sha = _required_string(row, 'sha')
+        subject = _required_string(row, 'subject')
+        patch_id = row.get('patch_id')
+        if not re.fullmatch(r'[0-9a-f]{40}', sha):
+            raise ManifestError(f'report field {field!r} contains an invalid commit SHA')
+        if not isinstance(patch_id, str) or (
+            patch_id and not re.fullmatch(r'[0-9a-f]{40,64}', patch_id)
+        ):
+            raise ManifestError(f'report field {field!r} contains an invalid patch-id')
+        identities.append(CommitIdentity(sha=sha, subject=subject, patch_id=patch_id))
+    return tuple(identities)
+
+
+def load_candidate(state_dir: Path, *, allow_cancelled: bool = False) -> CandidateResult:
+    state_dir = Path(state_dir)
+    if not allow_cancelled:
+        for marker_name in ('cancellation-intent.json', 'cancellation.json'):
+            marker_path = state_dir / marker_name
+            if _path_lexists(marker_path):
+                marker = _read_json_object(marker_path)
+                expected_status = 'cancelling' if marker_name == 'cancellation-intent.json' else 'cancelled'
+                if (
+                    marker.get('schema') != 1
+                    or marker.get('status') != expected_status
+                    or marker.get('candidate_id') != state_dir.resolve().name
+                ):
+                    raise ManifestError(f'candidate has an invalid {marker_name} marker')
+                raise ManifestError(f'candidate {state_dir.resolve().name!r} is cancelled')
+    report = _read_json_object(state_dir / 'report.json')
+    if report.get('schema') != 1:
+        raise ManifestError('unsupported candidate report schema')
+    candidate_id = _required_string(report, 'candidate_id')
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', candidate_id):
+        raise ManifestError('candidate report contains an invalid candidate_id')
+    if state_dir.resolve().name != candidate_id:
+        raise ManifestError('candidate report candidate_id does not match its directory')
+    reported_state_dir = Path(_required_string(report, 'state_dir'))
+    if reported_state_dir.resolve() != state_dir.resolve():
+        raise ManifestError('candidate report state_dir does not match its location')
+    worktree = Path(_required_string(report, 'worktree'))
+    if worktree.resolve() != (state_dir / 'worktree').resolve():
+        raise ManifestError('candidate worktree does not match its state directory')
+    status = _required_string(report, 'status')
+    if status not in {'conflict', 'review', 'ready'}:
+        raise ManifestError('candidate report contains an invalid status')
+
+    recommendations_value = report.get('recommendations', [])
+    if not isinstance(recommendations_value, list):
+        raise ManifestError('candidate recommendations must be an array')
+    recommendations: list[OptimizationRecommendation] = []
+    for item in recommendations_value:
+        if not isinstance(item, dict):
+            raise ManifestError('candidate recommendation must be an object')
+        feature_id = _required_string(item, 'feature_id')
+        kind = _required_string(item, 'kind')
+        if kind != 'upstream-equivalent':
+            raise ManifestError('candidate recommendation contains an invalid kind')
+        recommendations.append(
+            OptimizationRecommendation(
+                feature_id=feature_id,
+                kind=kind,
+                commit_subject=_required_string(item, 'commit_subject'),
+            )
+        )
+
+    conflicts = _report_string_list(report.get('conflicts', []), 'conflicts')
+    if status == 'conflict' and not conflicts:
+        raise ManifestError('conflict candidate report has no conflicts')
+    if status == 'review' and not recommendations:
+        raise ManifestError('review candidate report has no recommendations')
+    if status == 'ready' and (conflicts or recommendations):
+        raise ManifestError('ready candidate report contains unresolved decisions')
+
+    original_subjects = _report_string_list(
+        report.get('original_commit_subjects', []),
+        'original_commit_subjects',
+    )
+    candidate_subjects = _report_string_list(
+        report.get('candidate_commit_subjects', []),
+        'candidate_commit_subjects',
+    )
+    original_commits = _report_commit_identities(report.get('original_commits'), 'original_commits')
+    candidate_commits = _report_commit_identities(report.get('candidate_commits'), 'candidate_commits')
+    if original_subjects != tuple(item.subject for item in original_commits):
+        raise ManifestError('original commit subjects do not match commit identities')
+    if candidate_subjects != tuple(item.subject for item in candidate_commits):
+        raise ManifestError('candidate commit subjects do not match commit identities')
+
+    original_sha = _report_sha(report, 'original_sha')
+    upstream_sha = _report_sha(report, 'upstream_sha')
+    candidate_sha = _report_sha(report, 'candidate_sha')
+    if _path_lexists(worktree):
+        if _commit_identities(worktree, upstream_sha, original_sha) != original_commits:
+            raise ManifestError('original patch identities do not match the candidate repository')
+        if _commit_identities(worktree, upstream_sha, candidate_sha) != candidate_commits:
+            raise ManifestError('candidate patch identities do not match the candidate repository')
+    elif not allow_cancelled:
+        raise ManifestError('candidate worktree is missing')
+
+    return CandidateResult(
+        candidate_id=candidate_id,
+        state_dir=reported_state_dir,
+        worktree=worktree,
+        status=status,
+        original_sha=original_sha,
+        upstream_sha=upstream_sha,
+        candidate_sha=candidate_sha,
+        conflicts=conflicts,
+        original_commit_subjects=original_subjects,
+        candidate_commit_subjects=candidate_subjects,
+        recommendations=tuple(recommendations),
+        original_commits=original_commits,
+        candidate_commits=candidate_commits,
+    )
+
+
+def cancel_candidate(
+    manifest: ManagedUpdateManifest,
+    candidate: CandidateResult,
+) -> Path:
+    final_path = candidate.state_dir / 'cancellation.json'
+    if _path_lexists(final_path):
+        final = _read_json_object(final_path)
+        if (
+            final.get('schema') != 1
+            or final.get('status') != 'cancelled'
+            or final.get('candidate_id') != candidate.candidate_id
+        ):
+            raise ManifestError('candidate has an invalid cancellation report')
+        return final_path
+
+    persisted = load_candidate(candidate.state_dir, allow_cancelled=True)
+    if persisted != candidate:
+        raise ManifestError('candidate cancellation request does not match its persisted report')
+
+    intent_path = candidate.state_dir / 'cancellation-intent.json'
+    intent_exists = _path_lexists(intent_path)
+    if intent_exists:
+        intent = _read_json_object(intent_path)
+        if (
+            intent.get('schema') != 1
+            or intent.get('status') != 'cancelling'
+            or intent.get('candidate_id') != candidate.candidate_id
+        ):
+            raise ManifestError('candidate has an invalid cancellation intent')
+    else:
+        _verify_candidate_worktree_identity(manifest, candidate, 'cancellation')
+        _write_immutable_json(
+            intent_path,
+            {
+                'schema': 1,
+                'status': 'cancelling',
+                'candidate_id': candidate.candidate_id,
+                'candidate_sha': candidate.candidate_sha,
+                'manifest_sha256': manifest_digest(manifest),
+                'requested_at': int(time.time()),
+            },
+        )
+
+    if _path_lexists(candidate.worktree):
+        _verify_candidate_worktree_identity(manifest, candidate, 'cancellation cleanup')
+        removed = subprocess.run(
+            ['git', 'worktree', 'remove', '--force', str(candidate.worktree)],
+            cwd=manifest.worktree,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if removed.returncode != 0:
+            detail = removed.stderr.strip() or removed.stdout.strip()
+            raise ManifestError(f'cannot remove cancelled candidate worktree: {detail}')
+    if _path_lexists(candidate.worktree):
+        raise ManifestError('cancelled candidate worktree still exists after cleanup')
+
+    _write_immutable_json(
+        final_path,
+        {
+            'schema': 1,
+            'status': 'cancelled',
+            'candidate_id': candidate.candidate_id,
+            'candidate_sha': candidate.candidate_sha,
+            'manifest_sha256': manifest_digest(manifest),
+            'cancelled_at': int(time.time()),
+        },
+    )
+    return final_path
+
+
+def load_verified_candidate(
+    state_dir: Path,
+    candidate: CandidateResult,
+) -> VerifiedCandidate:
+    report = _read_json_object(Path(state_dir) / 'verification.json')
+    if report.get('schema') != 1:
+        raise ManifestError('unsupported verification report schema')
+    if _required_string(report, 'candidate_id') != candidate.candidate_id:
+        raise ManifestError('verification report candidate_id does not match candidate')
+    if _required_string(report, 'candidate_sha') != candidate.candidate_sha:
+        raise ManifestError('verification report candidate SHA does not match candidate')
+    if _required_string(report, 'status') != 'verified':
+        raise ManifestError('verification report status must be verified')
+
+    command_rows = report.get('commands', [])
+    if not isinstance(command_rows, list):
+        raise ManifestError('verification report commands must be an array')
+    commands: list[VerificationCommandResult] = []
+    for row in command_rows:
+        if not isinstance(row, dict):
+            raise ManifestError('verification command result must be an object')
+        returncode = row.get('returncode')
+        if not isinstance(returncode, int):
+            raise ManifestError('verification command returncode must be an integer')
+        if returncode != 0:
+            raise ManifestError('verification report contains a failed command')
+        commands.append(
+            VerificationCommandResult(
+                name=_required_string(row, 'name'),
+                returncode=returncode,
+                stdout=str(row.get('stdout', '')),
+                stderr=str(row.get('stderr', '')),
+            )
+        )
+
+    artifact_value = _required_string(report, 'artifact')
+    artifact = Path(artifact_value).resolve()
+    candidate_root = candidate.worktree.resolve()
+    if artifact != candidate_root and candidate_root not in artifact.parents:
+        raise ManifestError('verified artifact is outside the candidate worktree')
+    artifact_sha256 = _required_string(report, 'artifact_sha256')
+    if not re.fullmatch(r'[0-9a-f]{64}', artifact_sha256):
+        raise ManifestError('verification report contains an invalid artifact hash')
+    manifest_sha256 = _required_string(report, 'manifest_sha256')
+    if not re.fullmatch(r'[0-9a-f]{64}', manifest_sha256):
+        raise ManifestError('verification report contains an invalid manifest hash')
+    decision_value = report.get('decision_sha256')
+    if decision_value is not None and (
+        not isinstance(decision_value, str) or not re.fullmatch(r'[0-9a-f]{64}', decision_value)
+    ):
+        raise ManifestError('verification report contains an invalid decision hash')
+    current_decision_sha256 = _review_decision_digest(candidate)
+    if decision_value != current_decision_sha256:
+        raise ManifestError('verification report decision hash does not match current decision')
+    return VerifiedCandidate(
+        candidate_id=candidate.candidate_id,
+        status='verified',
+        artifact=artifact,
+        artifact_sha256=artifact_sha256,
+        manifest_sha256=manifest_sha256,
+        decision_sha256=current_decision_sha256,
+        commands=tuple(commands),
+    )
+
+
+def approval_token(
+    manifest: ManagedUpdateManifest,
+    candidate: CandidateResult,
+    verified: VerifiedCandidate,
+) -> str:
+    payload = {
+        'candidate_id': candidate.candidate_id,
+        'original_sha': candidate.original_sha,
+        'upstream_sha': candidate.upstream_sha,
+        'candidate_sha': candidate.candidate_sha,
+        'artifact': str(verified.artifact),
+        'artifact_sha256': verified.artifact_sha256,
+        'manifest_sha256': verified.manifest_sha256,
+        'decision_sha256': verified.decision_sha256,
+        'installed_app': str(manifest.installed_app),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _default_copy_bundle(source: Path, target: Path) -> None:
+    ditto = Path('/usr/bin/ditto')
+    if ditto.exists():
+        completed = subprocess.run(
+            [str(ditto), str(source), str(target)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise ManifestError(f'ditto failed: {detail}')
+        return
+    shutil.copytree(source, target, symlinks=True)
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def _rename_swap(first: Path, second: Path) -> None:
+    if os.uname().sysname != 'Darwin':
+        raise ManifestError('atomic app exchange requires macOS renamex_np support')
+    libc = ctypes.CDLL(None, use_errno=True)
+    renamex_np = libc.renamex_np
+    renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    renamex_np.restype = ctypes.c_int
+    rename_swap = 0x00000002
+    if renamex_np(os.fsencode(first), os.fsencode(second), rename_swap) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), f'{first} <-> {second}')
+
+
+def _path_lexists(path: Path) -> bool:
+    return os.path.lexists(path)
+
+
+def _move_bundle(source: Path, destination: Path) -> None:
+    source.replace(destination)
+
+
+def _swap_app_bundle(
+    target: Path,
+    staged: Path,
+    backup: Path,
+    health_check: Callable[[Path], bool],
+    *,
+    move_to_backup: Callable[[Path, Path], None] | None = None,
+) -> None:
+    mover = move_to_backup or _move_bundle
+    exchanged = False
+    try:
+        _rename_swap(target, staged)
+        exchanged = True
+        mover(staged, backup)
+        if not health_check(target):
+            raise ManifestError('installed candidate failed the health check')
+    except Exception as original_error:
+        rollback_error: Exception | None = None
+        if exchanged:
+            try:
+                staged_exists = _path_lexists(staged)
+                backup_exists = _path_lexists(backup)
+                if staged_exists == backup_exists:
+                    raise ManifestError(
+                        'cannot identify exactly one retained old bundle for atomic rollback'
+                    )
+                rollback_source = staged if staged_exists else backup
+                _rename_swap(target, rollback_source)
+                _remove_path(rollback_source)
+            except Exception as error:
+                rollback_error = error
+        else:
+            _remove_path(staged)
+        if rollback_error is not None:
+            raise ManifestError(
+                f'app exchange failed ({original_error}); atomic rollback also failed ({rollback_error})'
+            ) from original_error
+        raise
+
+
+@contextmanager
+def _repository_update_lock(manifest: ManagedUpdateManifest):
+    common_dir = Path(
+        _run_git(
+            manifest.worktree,
+            'rev-parse',
+            '--path-format=absolute',
+            '--git-common-dir',
+        )
+    ).resolve()
+    lock_path = common_dir / 'hermes-managed-update.lock'
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _transaction_path(value: Any, field: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ManifestError(f'install transaction field {field!r} must be a path')
+    return Path(value).expanduser().resolve()
+
+
+def _recover_install_transaction_locked(
+    manifest: ManagedUpdateManifest,
+    state_dir: Path,
+) -> Path:
+    state_dir = Path(state_dir).resolve()
+    transaction = _read_json_object(state_dir / 'transaction.json')
+    if transaction.get('schema') != 1 or transaction.get('status') != 'installing':
+        raise ManifestError('invalid install transaction journal')
+    candidate_id = _required_string(transaction, 'candidate_id')
+    if candidate_id != state_dir.name or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', candidate_id):
+        raise ManifestError('install transaction candidate identity is invalid')
+    if _required_string(transaction, 'manifest_sha256') != manifest_digest(manifest):
+        raise ManifestError('install transaction manifest does not match current configuration')
+
+    target = _transaction_path(transaction.get('target'), 'target')
+    staged = _transaction_path(transaction.get('staged'), 'staged')
+    backup = _transaction_path(transaction.get('backup'), 'backup')
+    expected_target = manifest.installed_app.resolve()
+    expected_staged = expected_target.with_name(f'.{expected_target.stem}.install-{candidate_id}.app')
+    expected_backup = expected_target.with_name(f'.{expected_target.stem}.rollback-{candidate_id}.app')
+    if target != expected_target or staged != expected_staged or backup != expected_backup:
+        raise ManifestError('install transaction bundle paths do not match the manifest and candidate')
+
+    original_sha = _report_sha(transaction, 'original_sha')
+    candidate_sha = _report_sha(transaction, 'candidate_sha')
+    original_artifact_sha256 = _required_string(transaction, 'original_artifact_sha256')
+    candidate_artifact_sha256 = _required_string(transaction, 'candidate_artifact_sha256')
+    if not re.fullmatch(r'[0-9a-f]{64}', original_artifact_sha256) or not re.fullmatch(
+        r'[0-9a-f]{64}', candidate_artifact_sha256
+    ):
+        raise ManifestError('install transaction contains an invalid bundle hash')
+    if original_artifact_sha256 == candidate_artifact_sha256:
+        raise ManifestError('install transaction cannot distinguish old and candidate bundles')
+
+    install_report = state_dir / 'install.json'
+    if _path_lexists(install_report):
+        installed = _read_json_object(install_report)
+        if (
+            installed.get('schema') != 1
+            or installed.get('candidate_id') != candidate_id
+            or installed.get('status') != 'installed'
+            or installed.get('original_sha') != original_sha
+            or installed.get('candidate_sha') != candidate_sha
+            or installed.get('artifact_sha256') != candidate_artifact_sha256
+        ):
+            raise ManifestError('invalid committed install report')
+        if _run_git(manifest.worktree, 'rev-parse', 'HEAD^{commit}') != candidate_sha:
+            raise ManifestError('committed install report does not match active Git HEAD')
+        if not _path_lexists(target) or _hash_artifact(target) != candidate_artifact_sha256:
+            raise ManifestError('committed install report does not match the installed app bundle')
+        if not _path_lexists(backup) or _hash_artifact(backup) != original_artifact_sha256:
+            raise ManifestError('committed install report does not match the retained rollback bundle')
+        if _path_lexists(staged):
+            raise ManifestError('committed install left an unexpected staging bundle')
+        return install_report
+
+    recovery_report = state_dir / 'recovery.json'
+    if _path_lexists(recovery_report):
+        recovered = _read_json_object(recovery_report)
+        if (
+            recovered.get('schema') != 1
+            or recovered.get('candidate_id') != candidate_id
+            or recovered.get('status') != 'rolled-back'
+        ):
+            raise ManifestError('invalid install recovery report')
+        return recovery_report
+
+    if not _path_lexists(target):
+        raise ManifestError('cannot recover install transaction because the target app is missing')
+
+    def bundle_hash(path: Path) -> str | None:
+        return _hash_artifact(path) if _path_lexists(path) else None
+
+    target_hash = bundle_hash(target)
+    side_hashes = {path: bundle_hash(path) for path in (staged, backup)}
+    if target_hash == candidate_artifact_sha256:
+        old_sources = [path for path, digest in side_hashes.items() if digest == original_artifact_sha256]
+        if len(old_sources) != 1:
+            raise ManifestError('cannot identify exactly one original bundle for transaction recovery')
+        source = old_sources[0]
+        _rename_swap(target, source)
+        side_hashes[source] = candidate_artifact_sha256
+    elif target_hash != original_artifact_sha256:
+        raise ManifestError('target app hash matches neither the original nor candidate bundle')
+
+    for path, digest in side_hashes.items():
+        if digest is None:
+            continue
+        if digest not in (original_artifact_sha256, candidate_artifact_sha256):
+            if target_hash == original_artifact_sha256 and path == staged:
+                _remove_path(path)
+                continue
+            raise ManifestError(f'cannot safely remove unrecognized recovery bundle: {path}')
+        _remove_path(path)
+
+    if _hash_artifact(target) != original_artifact_sha256:
+        raise ManifestError('transaction recovery did not restore the original app bundle')
+
+    head = _run_git(manifest.worktree, 'rev-parse', 'HEAD^{commit}')
+    if head == candidate_sha:
+        _run_git(manifest.worktree, 'reset', '--keep', original_sha)
+    elif head != original_sha:
+        raise ManifestError('active Git HEAD matches neither side of the install transaction')
+    if _run_git(manifest.worktree, 'rev-parse', 'HEAD^{commit}') != original_sha:
+        raise ManifestError('transaction recovery did not restore the original Git HEAD')
+
+    _write_immutable_json(
+        recovery_report,
+        {
+            'schema': 1,
+            'status': 'rolled-back',
+            'candidate_id': candidate_id,
+            'original_sha': original_sha,
+            'candidate_sha': candidate_sha,
+            'recovered_at': int(time.time()),
+        },
+    )
+    return recovery_report
+
+
+def recover_install_transaction(
+    manifest: ManagedUpdateManifest,
+    state_dir: Path,
+) -> Path:
+    with _repository_update_lock(manifest):
+        return _recover_install_transaction_locked(manifest, state_dir)
+
+
+def recover_pending_install_transactions(
+    manifest: ManagedUpdateManifest,
+    state_root: Path,
+) -> tuple[Path, ...]:
+    state_root = Path(state_root).expanduser().resolve()
+    if not _path_lexists(state_root):
+        return ()
+    if not state_root.is_dir() or state_root.is_symlink():
+        raise ManifestError('managed update state root must be a real directory')
+
+    recovered: list[Path] = []
+    for state_dir in sorted(state_root.iterdir(), key=lambda item: item.name):
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', state_dir.name):
+            continue
+        if not state_dir.is_dir() or state_dir.is_symlink():
+            continue
+        transaction = state_dir / 'transaction.json'
+        if not _path_lexists(transaction):
+            continue
+        if _path_lexists(state_dir / 'install.json') or _path_lexists(state_dir / 'recovery.json'):
+            continue
+        recovered.append(recover_install_transaction(manifest, state_dir))
+    return tuple(recovered)
+
+
+def _install_verified_candidate_locked(
+    manifest: ManagedUpdateManifest,
+    candidate: CandidateResult,
+    verified: VerifiedCandidate,
+    *,
+    confirmation_token: str,
+    copy_bundle: Callable[[Path, Path], None] = _default_copy_bundle,
+    health_check: Callable[[Path], bool],
+) -> InstallResult:
+    current_manifest_sha256 = manifest_digest(manifest)
+    if verified.manifest_sha256 != current_manifest_sha256:
+        raise ManifestError('managed update manifest changed after candidate verification')
+    if verified.decision_sha256 != _review_decision_digest(candidate):
+        raise ManifestError('review decision changed after candidate verification')
+    if not manifest.artifact:
+        raise ManifestError('manifest does not configure an artifact')
+    expected_artifact = _candidate_path(candidate.worktree, manifest.artifact, must_exist=True)
+    if verified.artifact.resolve(strict=True) != expected_artifact:
+        raise ManifestError('verified artifact does not match the manifest artifact path')
+    expected_token = approval_token(manifest, candidate, verified)
+    if not hmac.compare_digest(confirmation_token, expected_token):
+        raise ManifestError('confirmation token does not match the verified candidate')
+    if verified.candidate_id != candidate.candidate_id or verified.status != 'verified':
+        raise ManifestError('verified candidate identity or status is invalid')
+    _verify_candidate_source(manifest, candidate, 'installation')
+    if _hash_artifact(verified.artifact) != verified.artifact_sha256:
+        raise ManifestError('verified artifact changed after verification')
+
+    repository = inspect_repository(manifest)
+    if repository.current_branch != manifest.branch:
+        raise ManifestError('active branch changed after candidate preparation')
+    if repository.original_sha != candidate.original_sha:
+        raise ManifestError('active HEAD changed after candidate preparation')
+    if not repository.clean:
+        raise ManifestError('active worktree changed after candidate preparation')
+    resolved_candidate_sha = _run_git(
+        manifest.worktree,
+        'rev-parse',
+        f'{candidate.candidate_sha}^{{commit}}',
+    )
+    if resolved_candidate_sha != candidate.candidate_sha:
+        raise ManifestError('candidate commit no longer resolves to the verified SHA')
+
+    target = manifest.installed_app
+    backup = target.with_name(f'.{target.stem}.rollback-{candidate.candidate_id}.app')
+    staged = target.with_name(f'.{target.stem}.install-{candidate.candidate_id}.app')
+    transaction_path = candidate.state_dir / 'transaction.json'
+    if _path_lexists(transaction_path):
+        recovered = _recover_install_transaction_locked(manifest, candidate.state_dir)
+        if recovered.name == 'install.json':
+            raise ManifestError('candidate installation is already committed')
+        raise ManifestError('a previous candidate installation was recovered and cannot be replayed')
+    if _path_lexists(backup) or _path_lexists(staged):
+        raise ManifestError('stale install or rollback bundle blocks this update')
+
+    original_artifact_sha256 = _hash_artifact(target)
+    if original_artifact_sha256 == verified.artifact_sha256:
+        raise ManifestError('candidate app bundle is identical to the installed app bundle')
+    _write_immutable_json(
+        transaction_path,
+        {
+            'schema': 1,
+            'status': 'installing',
+            'candidate_id': candidate.candidate_id,
+            'manifest_sha256': current_manifest_sha256,
+            'original_sha': candidate.original_sha,
+            'candidate_sha': candidate.candidate_sha,
+            'target': str(target),
+            'staged': str(staged),
+            'backup': str(backup),
+            'original_artifact_sha256': original_artifact_sha256,
+            'candidate_artifact_sha256': verified.artifact_sha256,
+            'started_at': int(time.time()),
+        },
+    )
+
+    safety_ref = f'refs/hermes-managed-update/safety/{candidate.candidate_id}'
+    branch_promoted = False
+    app_swapped = False
+    try:
+        copy_bundle(verified.artifact, staged)
+        if _hash_artifact(staged) != verified.artifact_sha256:
+            raise ManifestError('staged app hash does not match the verified artifact')
+
+        _run_git(
+            manifest.worktree,
+            'update-ref',
+            safety_ref,
+            candidate.original_sha,
+        )
+        _run_git(manifest.worktree, 'reset', '--keep', candidate.candidate_sha)
+        branch_promoted = True
+        promoted_repository = inspect_repository(manifest)
+        if (
+            promoted_repository.original_sha != candidate.candidate_sha
+            or not promoted_repository.clean
+        ):
+            raise ManifestError('active worktree drifted while promoting the candidate')
+
+        _swap_app_bundle(target, staged, backup, health_check)
+        app_swapped = True
+
+        result = InstallResult(
+            candidate_id=candidate.candidate_id,
+            status='installed',
+            safety_ref=safety_ref,
+            backup_path=backup,
+        )
+        report = {
+            'schema': 1,
+            'candidate_id': result.candidate_id,
+            'status': result.status,
+            'safety_ref': result.safety_ref,
+            'original_sha': candidate.original_sha,
+            'candidate_sha': candidate.candidate_sha,
+            'artifact_sha256': verified.artifact_sha256,
+        }
+        _write_immutable_json(candidate.state_dir / 'install.json', report)
+        return result
+    except Exception as error:
+        rollback_errors: list[str] = []
+        try:
+            if app_swapped:
+                if not _path_lexists(backup):
+                    raise ManifestError('retained rollback bundle is missing')
+                _rename_swap(target, backup)
+                _remove_path(backup)
+            else:
+                _remove_path(staged)
+        except Exception as rollback_error:
+            rollback_errors.append(f'app rollback failed: {rollback_error}')
+
+        if branch_promoted:
+            try:
+                _run_git(manifest.worktree, 'reset', '--keep', candidate.original_sha)
+            except Exception as rollback_error:
+                rollback_errors.append(f'Git rollback failed: {rollback_error}')
+
+        if not rollback_errors:
+            try:
+                _write_immutable_json(
+                    candidate.state_dir / 'recovery.json',
+                    {
+                        'schema': 1,
+                        'status': 'rolled-back',
+                        'candidate_id': candidate.candidate_id,
+                        'original_sha': candidate.original_sha,
+                        'candidate_sha': candidate.candidate_sha,
+                        'recovered_at': int(time.time()),
+                    },
+                )
+            except Exception as recovery_error:
+                rollback_errors.append(f'recovery journal failed: {recovery_error}')
+
+        if rollback_errors:
+            details = '; '.join(rollback_errors)
+            raise ManifestError(f'candidate installation failed ({error}); {details}') from error
+        if isinstance(error, ManifestError):
+            raise
+        raise ManifestError(f'candidate installation failed: {error}') from error
+
+
+def install_verified_candidate(
+    manifest: ManagedUpdateManifest,
+    candidate: CandidateResult,
+    verified: VerifiedCandidate,
+    *,
+    confirmation_token: str,
+    copy_bundle: Callable[[Path, Path], None] = _default_copy_bundle,
+    health_check: Callable[[Path], bool],
+) -> InstallResult:
+    with _repository_update_lock(manifest):
+        return _install_verified_candidate_locked(
+            manifest,
+            candidate,
+            verified,
+            confirmation_token=confirmation_token,
+            copy_bundle=copy_bundle,
+            health_check=health_check,
+        )
+
+
+def _fetch_configured_upstream(manifest: ManagedUpdateManifest) -> None:
+    if '/' not in manifest.upstream:
+        raise ManifestError('upstream must use remote/branch form')
+    remote, branch = manifest.upstream.split('/', 1)
+    if not remote or not branch:
+        raise ManifestError('upstream must use remote/branch form')
+    _run_git(
+        manifest.worktree,
+        'fetch',
+        '--prune',
+        remote,
+        f'{branch}:refs/remotes/{remote}/{branch}',
+    )
+
+
+def _emit_event(payload: dict[str, Any]) -> None:
+    print(json.dumps(payload, sort_keys=True, separators=(',', ':')), flush=True)
+
+
+def _wait_for_process_exit(pid: int, timeout_seconds: float = 30.0) -> None:
+    if pid <= 0 or pid == os.getpid():
+        raise ManifestError('wait-pid must identify another live process')
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        except PermissionError as error:
+            raise ManifestError(f'cannot inspect process {pid}: {error}') from error
+        time.sleep(0.1)
+    raise ManifestError(f'timed out waiting for process {pid} to exit')
+
+
+def _terminate_failed_candidate(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def _installed_app_health_check(
+    target: Path,
+    *,
+    timeout_seconds: float = 120,
+    stabilization_seconds: float = 2,
+) -> bool:
+    info_plist = target / 'Contents' / 'Info.plist'
+    executable_dir = target / 'Contents' / 'MacOS'
+    if not info_plist.is_file() or not executable_dir.is_dir():
+        return False
+    try:
+        with info_plist.open('rb') as handle:
+            plist = plistlib.load(handle)
+    except (OSError, plistlib.InvalidFileException):
+        return False
+    executable_name = plist.get('CFBundleExecutable')
+    if not isinstance(executable_name, str) or not executable_name or '/' in executable_name:
+        return False
+    executable = (executable_dir / executable_name).resolve(strict=True)
+    if executable_dir.resolve() not in executable.parents or not executable.is_file():
+        return False
+
+    codesign = Path('/usr/bin/codesign')
+    if codesign.exists():
+        verified = subprocess.run(
+            [str(codesign), '--verify', '--deep', '--strict', str(target)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if verified.returncode != 0:
+            return False
+
+    token = secrets.token_hex(32)
+    readiness = Path(tempfile.gettempdir()) / (
+        f'hermes-managed-update-health-{os.getpid()}-{secrets.token_hex(8)}.json'
+    )
+    readiness.unlink(missing_ok=True)
+    process: subprocess.Popen[bytes] | None = None
+    healthy = False
+    try:
+        process = subprocess.Popen(
+            [
+                str(executable),
+                '--managed-update-health-file',
+                str(readiness),
+                '--managed-update-health-token',
+                token,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                return False
+            try:
+                payload = json.loads(readiness.read_text(encoding='utf-8'))
+            except (FileNotFoundError, OSError, json.JSONDecodeError):
+                time.sleep(0.1)
+                continue
+            if payload.get('token') != token or payload.get('pid') != process.pid:
+                return False
+            stable_until = min(deadline, time.monotonic() + stabilization_seconds)
+            while time.monotonic() < stable_until:
+                if process.poll() is not None:
+                    return False
+                time.sleep(0.1)
+            healthy = process.poll() is None
+            return healthy
+        return False
+    finally:
+        readiness.unlink(missing_ok=True)
+        if process is not None and not healthy:
+            _terminate_failed_candidate(process)
+
+
+def main(argv: list[str] | None = None) -> int:
+    default_manifest = (
+        Path(os.environ.get('HERMES_HOME', Path.home() / '.hermes'))
+        / 'customizations'
+        / 'managed-update'
+        / 'manifest.json'
+    )
+    parser = argparse.ArgumentParser(prog='hermes-managed-update')
+    parser.add_argument('--manifest', type=Path, default=default_manifest)
+    commands = parser.add_subparsers(dest='command', required=True)
+    check_parser = commands.add_parser('check')
+    check_parser.add_argument('--no-fetch', action='store_true')
+    recover_parser = commands.add_parser('recover')
+    recover_parser.add_argument('--state-root', type=Path, required=True)
+    prepare_parser = commands.add_parser('prepare')
+    prepare_parser.add_argument('--state-root', type=Path, required=True)
+    prepare_parser.add_argument('--candidate-id', required=True)
+    prepare_parser.add_argument('--no-fetch', action='store_true')
+    accept_review_parser = commands.add_parser('accept-review')
+    accept_review_parser.add_argument('--state-root', type=Path, required=True)
+    accept_review_parser.add_argument('--candidate-id', required=True)
+    cancel_parser = commands.add_parser('cancel')
+    cancel_parser.add_argument('--state-root', type=Path, required=True)
+    cancel_parser.add_argument('--candidate-id', required=True)
+    install_parser = commands.add_parser('install')
+    install_parser.add_argument('--state-root', type=Path, required=True)
+    install_parser.add_argument('--candidate-id', required=True)
+    install_parser.add_argument('--confirmation-token', required=True)
+    install_parser.add_argument('--wait-pid', type=int)
+    args = parser.parse_args(argv)
+
+    try:
+        manifest = load_manifest(args.manifest)
+        if args.command == 'check':
+            if not args.no_fetch:
+                _fetch_configured_upstream(manifest)
+            status = inspect_repository(manifest)
+            _emit_event(
+                {
+                    'event': 'check-complete',
+                    'branch': status.current_branch,
+                    'original_sha': status.original_sha,
+                    'upstream_sha': status.upstream_sha,
+                    'ahead': status.ahead,
+                    'behind': status.behind,
+                    'clean': status.clean,
+                    'custom_commits': len(status.custom_commit_subjects),
+                    'custom_commit_subjects': list(status.custom_commit_subjects),
+                }
+            )
+            return 0
+        if args.command == 'recover':
+            recovered = recover_pending_install_transactions(manifest, args.state_root)
+            _emit_event(
+                {
+                    'event': 'recovery-complete',
+                    'recovered': len(recovered),
+                    'reports': [str(path) for path in recovered],
+                }
+            )
+            return 0
+        if args.command == 'prepare':
+            if not args.no_fetch:
+                _fetch_configured_upstream(manifest)
+            candidate = prepare_candidate(
+                manifest,
+                args.state_root,
+                candidate_id=args.candidate_id,
+            )
+            if candidate.status != 'ready':
+                _emit_event(
+                    {
+                        'event': 'candidate-decision',
+                        'candidate_id': candidate.candidate_id,
+                        'status': candidate.status,
+                        'original_sha': candidate.original_sha,
+                        'upstream_sha': candidate.upstream_sha,
+                        'candidate_sha': candidate.candidate_sha,
+                        'conflicts': list(candidate.conflicts),
+                        'recommendations': [
+                            {
+                                'feature_id': item.feature_id,
+                                'kind': item.kind,
+                                'commit_subject': item.commit_subject,
+                            }
+                            for item in candidate.recommendations
+                        ],
+                        'report': str(candidate.state_dir / 'report.json'),
+                    }
+                )
+                return 0
+            verified = verify_candidate(manifest, candidate)
+            _emit_event(
+                {
+                    'event': 'candidate-ready',
+                    'candidate_id': candidate.candidate_id,
+                    'status': verified.status,
+                    'original_sha': candidate.original_sha,
+                    'upstream_sha': candidate.upstream_sha,
+                    'candidate_sha': candidate.candidate_sha,
+                    'artifact': str(verified.artifact),
+                    'artifact_sha256': verified.artifact_sha256,
+                    'confirmation_token': approval_token(manifest, candidate, verified),
+                    'report': str(candidate.state_dir / 'verification.json'),
+                }
+            )
+            return 0
+        if args.command == 'accept-review':
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', args.candidate_id):
+                raise ManifestError('invalid candidate_id')
+            state_root = args.state_root.resolve()
+            state_dir = (state_root / args.candidate_id).resolve()
+            if state_dir.parent != state_root:
+                raise ManifestError('candidate state directory escapes state root')
+            candidate = load_candidate(state_dir)
+            verified = accept_candidate_review(manifest, candidate)
+            _emit_event(
+                {
+                    'event': 'candidate-ready',
+                    'candidate_id': candidate.candidate_id,
+                    'status': verified.status,
+                    'original_sha': candidate.original_sha,
+                    'upstream_sha': candidate.upstream_sha,
+                    'candidate_sha': candidate.candidate_sha,
+                    'artifact': str(verified.artifact),
+                    'artifact_sha256': verified.artifact_sha256,
+                    'confirmation_token': approval_token(manifest, candidate, verified),
+                    'report': str(candidate.state_dir / 'verification.json'),
+                }
+            )
+            return 0
+        if args.command == 'cancel':
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', args.candidate_id):
+                raise ManifestError('invalid candidate_id')
+            state_root = args.state_root.resolve()
+            state_dir = (state_root / args.candidate_id).resolve()
+            if state_dir.parent != state_root:
+                raise ManifestError('candidate state directory escapes state root')
+            candidate = load_candidate(state_dir, allow_cancelled=True)
+            report = cancel_candidate(manifest, candidate)
+            _emit_event(
+                {
+                    'event': 'candidate-cancelled',
+                    'candidate_id': candidate.candidate_id,
+                    'status': 'cancelled',
+                    'report': str(report),
+                }
+            )
+            return 0
+        if args.command == 'install':
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', args.candidate_id):
+                raise ManifestError('invalid candidate_id')
+            state_root = args.state_root.resolve()
+            state_dir = (state_root / args.candidate_id).resolve()
+            if state_dir.parent != state_root:
+                raise ManifestError('candidate state directory escapes state root')
+            if args.wait_pid is not None:
+                _wait_for_process_exit(args.wait_pid)
+            candidate = load_candidate(state_dir)
+            verified = load_verified_candidate(state_dir, candidate)
+            installed = install_verified_candidate(
+                manifest,
+                candidate,
+                verified,
+                confirmation_token=args.confirmation_token,
+                health_check=_installed_app_health_check,
+            )
+            _emit_event(
+                {
+                    'event': 'install-complete',
+                    'candidate_id': installed.candidate_id,
+                    'status': installed.status,
+                    'safety_ref': installed.safety_ref,
+                    'report': str(candidate.state_dir / 'install.json'),
+                }
+            )
+            return 0
+        raise ManifestError(f'unsupported command: {args.command}')
+    except Exception as error:
+        _emit_event(
+            {
+                'event': 'error',
+                'error': error.__class__.__name__,
+                'message': str(error),
+            }
+        )
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

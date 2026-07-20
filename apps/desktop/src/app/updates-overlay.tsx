@@ -13,7 +13,12 @@ import {
 } from '@/components/ui/dialog'
 import { ErrorIcon, ErrorState } from '@/components/ui/error-state'
 import { Loader } from '@/components/ui/loader'
-import type { DesktopUpdateCommit, DesktopUpdateStage, DesktopUpdateStatus } from '@/global'
+import type {
+  DesktopUpdateApplyOptions,
+  DesktopUpdateCommit,
+  DesktopUpdateStage,
+  DesktopUpdateStatus
+} from '@/global'
 import { useI18n } from '@/i18n'
 import { buildCommitChangelog, type CommitGroup } from '@/lib/commit-changelog'
 import { AlertCircle, Check, Copy, Terminal } from '@/lib/icons'
@@ -39,6 +44,14 @@ import {
 
 function totalItems(groups: readonly CommitGroup[]) {
   return groups.reduce((sum, g) => sum + g.items.length, 0)
+}
+
+export function managedInstallRequest(candidateId: string): DesktopUpdateApplyOptions {
+  return { managedAction: 'install', candidateId }
+}
+
+export function managedCancelRequest(candidateId: string): DesktopUpdateApplyOptions {
+  return { managedAction: 'cancel', candidateId }
 }
 
 export function UpdatesOverlay() {
@@ -68,19 +81,35 @@ export function UpdatesOverlay() {
   const behind = status?.behind ?? 0
   const updateAvailable = status?.updateAvailable || behind > 0
 
-  const phase: 'idle' | 'applying' | 'manual' | 'guiSkew' | 'error' =
-    apply.stage === 'manual'
-      ? 'manual'
-      : apply.stage === 'guiSkew'
-        ? 'guiSkew'
-        : apply.applying || apply.stage === 'restart'
-          ? 'applying'
-          : apply.stage === 'error'
-            ? 'error'
-            : 'idle'
+  const phase: 'idle' | 'applying' | 'managedDecision' | 'managedConfirmation' | 'manual' | 'guiSkew' | 'error' =
+    apply.stage === 'managedDecision'
+      ? 'managedDecision'
+      : apply.stage === 'managedConfirmation'
+        ? 'managedConfirmation'
+        : apply.stage === 'manual'
+          ? 'manual'
+          : apply.stage === 'guiSkew'
+            ? 'guiSkew'
+            : apply.applying || apply.stage === 'restart'
+              ? 'applying'
+              : apply.stage === 'error'
+                ? 'error'
+                : 'idle'
 
   const handleClose = (next: boolean) => {
     if (phase === 'applying') {
+      return
+    }
+
+    const candidateId = apply.managed?.candidateId
+
+    if (
+      !next &&
+      candidateId &&
+      (apply.stage === 'managedDecision' || apply.stage === 'managedConfirmation')
+    ) {
+      void applyUpdates(managedCancelRequest(candidateId))
+
       return
     }
 
@@ -88,7 +117,12 @@ export function UpdatesOverlay() {
 
     if (
       !next &&
-      (apply.stage === 'error' || apply.stage === 'restart' || apply.stage === 'manual' || apply.stage === 'guiSkew')
+      (apply.stage === 'error' ||
+        apply.stage === 'restart' ||
+        apply.stage === 'managedDecision' ||
+        apply.stage === 'managedConfirmation' ||
+        apply.stage === 'manual' ||
+        apply.stage === 'guiSkew')
     ) {
       resetUpdateApplyState()
     }
@@ -96,6 +130,26 @@ export function UpdatesOverlay() {
 
   const handleInstall = () => {
     void install()
+  }
+
+  const handleManagedAcceptReview = () => {
+    const candidateId = apply.managed?.candidateId
+
+    if (!candidateId) {
+      return
+    }
+
+    void applyUpdates({ managedAction: 'accept-review', candidateId })
+  }
+
+  const handleManagedConfirm = () => {
+    const candidateId = apply.managed?.candidateId
+
+    if (!candidateId) {
+      return
+    }
+
+    void applyUpdates(managedInstallRequest(candidateId))
   }
 
   return (
@@ -108,6 +162,22 @@ export function UpdatesOverlay() {
         showCloseButton={phase !== 'applying'}
       >
         {phase === 'applying' && <ApplyingView apply={apply} isBackend={isBackend} />}
+
+        {phase === 'managedDecision' && (
+          <ManagedDecisionView
+            apply={apply}
+            onAcceptReview={handleManagedAcceptReview}
+            onCancel={() => handleClose(false)}
+          />
+        )}
+
+        {phase === 'managedConfirmation' && (
+          <ManagedConfirmationView
+            apply={apply}
+            onCancel={() => handleClose(false)}
+            onConfirm={handleManagedConfirm}
+          />
+        )}
 
         {phase === 'manual' && (
           <ManualView command={apply.command ?? null} message={apply.message} onDone={() => handleClose(false)} />
@@ -264,6 +334,135 @@ function IdleView({
       </div>
 
       {remaining > 0 && <p className="text-center text-xs text-muted-foreground">{u.moreChanges(remaining)}</p>}
+    </div>
+  )
+}
+
+export function ManagedDecisionView({
+  apply,
+  onAcceptReview,
+  onCancel
+}: {
+  apply: UpdateApplyState
+  onAcceptReview?: () => void
+  onCancel: () => void
+}) {
+  const { t } = useI18n()
+  const u = t.updates
+  const managed = apply.managed
+  const conflicts = managed?.conflicts ?? []
+  const recommendations = managed?.recommendations ?? []
+  const isConflict = managed?.decisionKind === 'conflict'
+
+  return (
+    <div className="grid gap-5 px-6 pb-6 pt-7 pr-8">
+      <div className="flex flex-col items-center gap-3 text-center">
+        <AlertCircle className="size-9 text-amber-500" />
+        <DialogTitle className="text-center text-xl">{u.managedDecisionTitle}</DialogTitle>
+        <DialogDescription className="text-center text-sm">
+          {isConflict ? u.managedConflictBody : u.managedReviewBody}
+        </DialogDescription>
+      </div>
+
+      {conflicts.length > 0 && (
+        <section className="grid gap-2">
+          <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            {u.managedConflictFiles}
+          </p>
+          <ul className="grid gap-1 rounded-md border border-border/70 bg-muted/35 p-3 font-mono text-xs">
+            {conflicts.map(file => (
+              <li className="break-all" key={file}>
+                {file}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {recommendations.length > 0 && (
+        <section className="grid gap-2">
+          <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            {u.managedRecommendations}
+          </p>
+          <ul className="grid gap-2 rounded-md border border-border/70 bg-muted/35 p-3 text-xs">
+            {recommendations.map(item => (
+              <li className="grid gap-1" key={item.feature_id}>
+                <span className="font-semibold">{item.feature_id}</span>
+                <span>
+                  {item.kind === 'upstream-equivalent' ? u.managedUpstreamEquivalentRecommendation : item.kind}
+                </span>
+                <span className="text-muted-foreground">
+                  {item.kind === 'upstream-equivalent'
+                    ? `${u.managedUpstreamEquivalentReason} ${item.commit_subject}`
+                    : item.commit_subject}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {managed?.report && (
+        <div className="grid gap-1 text-xs">
+          <span className="font-semibold text-muted-foreground">{u.managedReport}</span>
+          <code className="break-all rounded-md border border-border/70 bg-muted/35 px-3 py-2">{managed.report}</code>
+        </div>
+      )}
+
+      <div className="grid gap-2">
+        {!isConflict && recommendations.length > 0 && onAcceptReview && (
+          <Button className="font-semibold" onClick={onAcceptReview} size="lg">
+            {u.managedAcceptRecommendations}
+          </Button>
+        )}
+        <Button className="font-semibold" onClick={onCancel} size="lg" variant="secondary">
+          {u.managedCancel}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+export function ManagedConfirmationView({
+  apply,
+  onCancel,
+  onConfirm
+}: {
+  apply: UpdateApplyState
+  onCancel: () => void
+  onConfirm: () => void
+}) {
+  const { t } = useI18n()
+  const u = t.updates
+  const managed = apply.managed
+
+  return (
+    <div className="grid gap-5 px-6 pb-6 pt-7 pr-8">
+      <div className="flex flex-col items-center gap-3 text-center">
+        <Check className="size-9 text-primary" />
+        <DialogTitle className="text-center text-xl">{u.managedConfirmationTitle}</DialogTitle>
+        <DialogDescription className="text-center text-sm">{u.managedConfirmationBody}</DialogDescription>
+      </div>
+
+      <dl className="grid gap-3 rounded-md border border-border/70 bg-muted/35 p-3 text-xs">
+        <div className="grid gap-1">
+          <dt className="font-semibold text-muted-foreground">{u.managedCandidateCommit}</dt>
+          <dd className="break-all font-mono text-foreground">{managed?.candidateSha ?? '—'}</dd>
+        </div>
+        <div className="grid gap-1">
+          <dt className="font-semibold text-muted-foreground">{u.managedArtifactHash}</dt>
+          <dd className="break-all font-mono text-foreground">{managed?.artifactSha256 ?? '—'}</dd>
+        </div>
+      </dl>
+
+      <div className="grid gap-2">
+        <Button className="font-semibold" onClick={onConfirm} size="lg">
+          {u.managedInstallVerified}
+        </Button>
+        <Button className="font-medium" onClick={onCancel} type="button" variant="text">
+          {u.managedCancel}
+        </Button>
+      </div>
     </div>
   )
 }
