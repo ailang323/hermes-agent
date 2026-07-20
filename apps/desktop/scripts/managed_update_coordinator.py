@@ -1504,7 +1504,7 @@ def _fetch_configured_upstream(manifest: ManagedUpdateManifest) -> None:
         'fetch',
         '--prune',
         remote,
-        f'{branch}:refs/remotes/{remote}/{branch}',
+        f'refs/heads/{branch}:refs/remotes/{remote}/{branch}',
     )
 
 

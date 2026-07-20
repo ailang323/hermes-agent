@@ -9,13 +9,15 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from dataclasses import replace
 from contextlib import redirect_stdout
+from dataclasses import replace
 from unittest.mock import patch
 
+import scripts.managed_update_coordinator as coordinator
 from scripts.managed_update_coordinator import (
     CandidateResult,
     InstallResult,
+    ManagedUpdateManifest,
     ManifestError,
     VerifiedCandidate,
     _commit_identities,
@@ -51,6 +53,40 @@ def git(cwd: Path, *args: str) -> str:
 
 
 class ManifestTests(unittest.TestCase):
+    def test_fetch_uses_a_fully_qualified_remote_branch_refspec(self) -> None:
+        manifest = ManagedUpdateManifest(
+            schema=1,
+            mode='managed-patch-stack',
+            worktree=Path('/tmp/managed-update-worktree'),
+            branch='feat/longer-stable-v2',
+            upstream='upstream/main',
+            installed_app=Path('/Applications/Hermes.app'),
+            features=(),
+            verification_commands=(),
+            artifact=None,
+        )
+
+        calls: list[tuple[object, ...]] = []
+        original = coordinator._run_git
+        coordinator._run_git = lambda *args: calls.append(args) or ''
+        try:
+            coordinator._fetch_configured_upstream(manifest)
+        finally:
+            coordinator._run_git = original
+
+        self.assertEqual(
+            calls,
+            [
+                (
+                    manifest.worktree,
+                    'fetch',
+                    '--prune',
+                    'upstream',
+                    'refs/heads/main:refs/remotes/upstream/main',
+                )
+            ],
+        )
+
     def test_load_manifest_returns_normalized_managed_patch_stack_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temp:
             root = Path(raw_temp)
