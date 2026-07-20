@@ -326,7 +326,7 @@ export interface DesktopUpdateStatus {
 }
 
 export type DesktopUpdateDirtyStrategy = 'abort' | 'stash' | 'force'
-export type DesktopManagedUpdateAction = 'prepare' | 'accept-review' | 'cancel' | 'install'
+export type DesktopManagedUpdateAction = 'prepare' | 'accept-review' | 'resume-conflict' | 'cancel' | 'install'
 
 export interface DesktopUpdateApplyOptions {
   dirtyStrategy?: DesktopUpdateDirtyStrategy
@@ -355,6 +355,7 @@ export interface DesktopUpdateApplyResult {
   conflicts?: string[]
   recommendations?: DesktopManagedUpdateRecommendation[]
   report?: string
+  worktree?: string
   /** True when no staged updater exists (CLI install) and the user should run
    *  `hermes update` themselves. `command` is the exact line to run. */
   manual?: boolean

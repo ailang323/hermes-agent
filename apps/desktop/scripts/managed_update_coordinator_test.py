@@ -331,6 +331,148 @@ class CandidatePreparationTests(unittest.TestCase):
             self.assertEqual(report['status'], 'conflict')
             self.assertEqual(report['conflicts'], ['shared.txt'])
 
+    def test_upstream_equivalence_rejects_whitespace_only_control_flow_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp:
+            worktree = Path(raw_temp) / 'repository'
+            worktree.mkdir()
+            git(worktree, 'init', '-b', 'feature')
+            git(worktree, 'config', 'user.name', 'Managed Update Test')
+            git(worktree, 'config', 'user.email', 'managed-update@example.invalid')
+            source = worktree / 'policy.py'
+            source.write_text('if enabled:\n    permit()\n', encoding='utf-8')
+            git(worktree, 'add', 'policy.py')
+            git(worktree, 'commit', '-m', 'base')
+            base_sha = git(worktree, 'rev-parse', 'HEAD')
+
+            source.write_text('if enabled:\n    permit()\ndeny()\n', encoding='utf-8')
+            git(worktree, 'commit', '-am', 'feat: local policy')
+            local_sha = git(worktree, 'rev-parse', 'HEAD')
+
+            git(worktree, 'switch', '--detach', base_sha)
+            source.write_text('if enabled:\n    permit()\n    deny()\n', encoding='utf-8')
+            git(worktree, 'commit', '-am', 'feat: upstream policy')
+            upstream_sha = git(worktree, 'rev-parse', 'HEAD')
+            git(worktree, 'switch', 'feature')
+
+            self.assertEqual(
+                coordinator._commit_patch_id(worktree, local_sha),
+                coordinator._commit_patch_id(worktree, upstream_sha),
+                'the fixture must exercise git patch-id whitespace insensitivity',
+            )
+            self.assertNotIn(
+                local_sha,
+                coordinator._upstream_equivalent_commit_shas(
+                    worktree,
+                    upstream_sha,
+                    local_sha,
+                ),
+            )
+
+    def test_resume_conflict_records_an_immutable_resolution_and_reloads_ready_candidate(self) -> None:
+        resume = getattr(coordinator, 'resume_candidate_conflict', None)
+        if resume is None:
+            self.fail('resume_candidate_conflict API is missing')
+
+        with tempfile.TemporaryDirectory() as raw_temp:
+            root = Path(raw_temp)
+            worktree = root / 'active'
+            app = root / 'Hermes.app'
+            state_root = root / 'state'
+            worktree.mkdir()
+            app.mkdir()
+            git(worktree, 'init', '-b', 'feat/longer-stable-v2')
+            git(worktree, 'config', 'user.name', 'Managed Update Test')
+            git(worktree, 'config', 'user.email', 'managed-update@example.invalid')
+            shared = worktree / 'shared.txt'
+            shared.write_text('base\n', encoding='utf-8')
+            git(worktree, 'add', 'shared.txt')
+            git(worktree, 'commit', '-m', 'base')
+            base_sha = git(worktree, 'rev-parse', 'HEAD')
+            shared.write_text('custom\n', encoding='utf-8')
+            git(worktree, 'commit', '-am', 'feat: custom shared behavior')
+            original_sha = git(worktree, 'rev-parse', 'HEAD')
+
+            git(worktree, 'switch', '--detach', base_sha)
+            shared.write_text('upstream\n', encoding='utf-8')
+            git(worktree, 'commit', '-am', 'feat: upstream shared behavior')
+            upstream_sha = git(worktree, 'rev-parse', 'HEAD')
+            git(worktree, 'update-ref', 'refs/remotes/upstream/main', upstream_sha)
+            git(worktree, 'switch', 'feat/longer-stable-v2')
+
+            manifest_path = root / 'manifest.json'
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        'schema': 1,
+                        'mode': 'managed-patch-stack',
+                        'worktree': str(worktree),
+                        'branch': 'feat/longer-stable-v2',
+                        'upstream': 'upstream/main',
+                        'installed_app': str(app),
+                        'artifact': 'artifact.bin',
+                        'verification_commands': [],
+                        'features': [
+                            {
+                                'id': 'custom-shared',
+                                'commit_subject': 'feat: custom shared behavior',
+                            }
+                        ],
+                    }
+                ),
+                encoding='utf-8',
+            )
+            manifest = load_manifest(manifest_path)
+            candidate = prepare_candidate(manifest, state_root, candidate_id='candidate-resume')
+            self.assertEqual(candidate.status, 'conflict')
+
+            resolved_shared = candidate.worktree / 'shared.txt'
+            resolved_shared.write_text('upstream\ncustom\n', encoding='utf-8')
+            git(candidate.worktree, 'add', 'shared.txt')
+            git(candidate.worktree, '-c', 'core.editor=true', 'rebase', '--continue')
+            (candidate.worktree / 'artifact.bin').write_bytes(b'resolved artifact')
+
+            # Simulate a process interruption after the durable conflict resolution was
+            # written but before verification.json and candidate-ready were emitted.
+            resolved_candidate = resume(manifest, candidate)
+            self.assertEqual(resolved_candidate.status, 'ready')
+            self.assertFalse((candidate.state_dir / 'verification.json').exists())
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                exit_code = coordinator.main(
+                    [
+                        '--manifest',
+                        str(manifest_path),
+                        'resume-conflict',
+                        '--state-root',
+                        str(state_root),
+                        '--candidate-id',
+                        candidate.candidate_id,
+                    ]
+                )
+            self.assertEqual(exit_code, 0)
+            event = json.loads(output.getvalue())
+            self.assertEqual(event['event'], 'candidate-ready')
+            ready = load_candidate(candidate.state_dir)
+
+            self.assertEqual(ready.status, 'ready')
+            self.assertEqual(ready.conflicts, ())
+            self.assertEqual(ready.original_sha, original_sha)
+            self.assertEqual(ready.upstream_sha, upstream_sha)
+            self.assertEqual(ready.original_commit_subjects, ready.candidate_commit_subjects)
+            resolution_path = candidate.state_dir / 'conflict-resolution.json'
+            resolution = json.loads(resolution_path.read_text(encoding='utf-8'))
+            self.assertEqual(resolution['status'], 'resolved')
+            self.assertEqual(resolution['conflicts'], ['shared.txt'])
+            self.assertEqual(len(resolution['transformed_commits']), 1)
+            self.assertEqual(resolution['transformed_commits'][0]['subject'], 'feat: custom shared behavior')
+            decision_digest = coordinator._review_decision_digest(ready)
+            self.assertIsInstance(decision_digest, str)
+            self.assertRegex(decision_digest or '', r'^[0-9a-f]{64}$')
+            self.assertEqual(load_candidate(candidate.state_dir), ready)
+            self.assertEqual(git(worktree, 'rev-parse', 'HEAD'), original_sha)
+            self.assertEqual(git(worktree, 'status', '--porcelain=v1'), '')
+
     def test_prepare_candidate_requires_review_when_upstream_absorbs_a_feature(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temp:
             root = Path(raw_temp)
@@ -549,6 +691,53 @@ class CandidateCancellationTests(unittest.TestCase):
             with self.assertRaisesRegex(ManifestError, 'cancelled'):
                 load_candidate(state_dir)
 
+    def test_cancel_durably_invalidates_before_loading_a_malformed_report(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp:
+            root = Path(raw_temp)
+            active = root / 'active'
+            installed_app = root / 'Hermes.app'
+            state_root = root / 'state'
+            state_dir = state_root / 'malformed-candidate'
+            active.mkdir()
+            installed_app.mkdir()
+            state_dir.mkdir(parents=True)
+            (state_dir / 'report.json').write_text('{ malformed', encoding='utf-8')
+            manifest_path = root / 'manifest.json'
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        'schema': 1,
+                        'mode': 'managed-patch-stack',
+                        'worktree': str(active),
+                        'branch': 'feat/longer-stable-v2',
+                        'upstream': 'upstream/main',
+                        'installed_app': str(installed_app),
+                        'features': [],
+                    }
+                ),
+                encoding='utf-8',
+            )
+            stdout = io.StringIO()
+
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        '--manifest',
+                        str(manifest_path),
+                        'cancel',
+                        '--state-root',
+                        str(state_root),
+                        '--candidate-id',
+                        'malformed-candidate',
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            marker = json.loads((state_dir / 'cancellation-intent.json').read_text(encoding='utf-8'))
+            self.assertEqual(marker['status'], 'cancelling')
+            with self.assertRaisesRegex(ManifestError, 'cancelled'):
+                load_candidate(state_dir)
+
 
 class ArtifactHashTests(unittest.TestCase):
     def test_tree_hash_uses_unambiguous_record_boundaries(self) -> None:
@@ -619,7 +808,13 @@ class CandidateVerificationTests(unittest.TestCase):
                                 'argv': [
                                     sys.executable,
                                     '-c',
-                                    "from pathlib import Path; Path('artifact.bin').write_bytes(b'candidate')",
+                                    (
+                                        "import os; from pathlib import Path; "
+                                        f"assert os.environ.get('GITHUB_SHA') == {candidate_sha!r}; "
+                                        "assert os.environ.get('GITHUB_REF_NAME') == "
+                                        "'feat/longer-stable-v2'; "
+                                        "Path('artifact.bin').write_bytes(b'candidate')"
+                                    ),
                                 ],
                                 'cwd': '.',
                             }
@@ -656,6 +851,15 @@ class CandidateVerificationTests(unittest.TestCase):
             with self.assertRaisesRegex(ManifestError, 'HEAD'):
                 verify_candidate(load_manifest(manifest_path), candidate)
             git(worktree, 'reset', '--hard', candidate_sha)
+
+            with (
+                patch(
+                    'scripts.managed_update_coordinator._review_decision_digest',
+                    side_effect=['before-build', 'after-build'],
+                ),
+                self.assertRaisesRegex(ManifestError, 'changed during candidate verification'),
+            ):
+                verify_candidate(load_manifest(manifest_path), candidate)
 
             verified = verify_candidate(load_manifest(manifest_path), candidate)
 
@@ -720,6 +924,35 @@ class CandidateInstallationTests(unittest.TestCase):
             self.assertEqual((target / 'marker.txt').read_text(encoding='utf-8'), 'old\n')
             self.assertFalse(staged.exists())
             self.assertFalse(backup.exists())
+
+    def test_atomic_app_swap_preserves_old_bundle_when_inner_rollback_cannot_identify_one_side(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp:
+            root = Path(raw_temp)
+            target = root / 'Hermes.app'
+            staged = root / '.Hermes.install.app'
+            backup = root / '.Hermes.rollback.app'
+            target.mkdir()
+            staged.mkdir()
+            backup.mkdir()
+            (target / 'marker.txt').write_text('old\n', encoding='utf-8')
+            (staged / 'marker.txt').write_text('new\n', encoding='utf-8')
+            (backup / 'marker.txt').write_text('raced\n', encoding='utf-8')
+
+            def fail_backup_move(_source: Path, _destination: Path) -> None:
+                raise OSError('injected raced backup failure')
+
+            with self.assertRaisesRegex(ManifestError, 'atomic rollback also failed'):
+                _swap_app_bundle(
+                    target,
+                    staged,
+                    backup,
+                    lambda _target: True,
+                    move_to_backup=fail_backup_move,
+                )
+
+            self.assertEqual((target / 'marker.txt').read_text(encoding='utf-8'), 'new\n')
+            self.assertEqual((staged / 'marker.txt').read_text(encoding='utf-8'), 'old\n')
+            self.assertEqual((backup / 'marker.txt').read_text(encoding='utf-8'), 'raced\n')
 
     def test_install_verified_candidate_promotes_exact_commit_and_atomically_swaps_app(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temp:
@@ -803,17 +1036,36 @@ class CandidateInstallationTests(unittest.TestCase):
                     candidate,
                     verified,
                     confirmation_token=approval_token(manifest, candidate, verified),
+                    confirmed_candidate_sha=candidate.candidate_sha,
+                    confirmed_artifact_sha256=verified.artifact_sha256,
                     copy_bundle=copy_test_bundle,
                     health_check=lambda _target: True,
                 )
             self.assertEqual(git(active, 'rev-parse', 'HEAD'), original_sha)
             self.assertEqual((other_app / 'version.txt').read_text(encoding='utf-8'), 'unrelated\n')
 
+            forged_recovery = state_dir / 'recovery.json'
+            forged_recovery.write_text('{"schema":1,"status":"rolled-back"}', encoding='utf-8')
+            with self.assertRaisesRegex(ManifestError, 'pre-existing install or recovery report'):
+                install_verified_candidate(
+                    manifest,
+                    candidate,
+                    verified,
+                    confirmation_token=approval_token(manifest, candidate, verified),
+                    confirmed_candidate_sha=candidate.candidate_sha,
+                    confirmed_artifact_sha256=verified.artifact_sha256,
+                    copy_bundle=copy_test_bundle,
+                    health_check=lambda _target: True,
+                )
+            forged_recovery.unlink()
+
             installed = install_verified_candidate(
                 manifest,
                 candidate,
                 verified,
                 confirmation_token=approval_token(manifest, candidate, verified),
+                confirmed_candidate_sha=candidate.candidate_sha,
+                confirmed_artifact_sha256=verified.artifact_sha256,
                 copy_bundle=copy_test_bundle,
                 health_check=lambda target: (target / 'marker.txt').read_text(
                     encoding='utf-8'
@@ -924,6 +1176,13 @@ class InstallRecoveryTests(unittest.TestCase):
                 self.assertFalse(staged.exists())
                 self.assertFalse(backup.exists())
                 self.assertEqual(json.loads(report.read_text(encoding='utf-8'))['status'], 'rolled-back')
+
+                tampered = json.loads(report.read_text(encoding='utf-8'))
+                tampered['candidate_sha'] = 'f' * 40
+                report.chmod(0o600)
+                report.write_text(json.dumps(tampered), encoding='utf-8')
+                with self.assertRaisesRegex(ManifestError, 'invalid install recovery report'):
+                    recover_pending_install_transactions(manifest, root / 'state')
 
 
 class CoordinatorCliTests(unittest.TestCase):
@@ -1099,6 +1358,8 @@ class CoordinatorCliTests(unittest.TestCase):
                 manifest_sha256='e' * 64,
                 decision_sha256=None,
                 commands=(),
+                approval_token_sha256=hashlib.sha256(('f' * 64).encode('ascii')).hexdigest(),
+                confirmation_token='f' * 64,
             )
             output = io.StringIO()
 
@@ -1174,6 +1435,8 @@ class CoordinatorCliTests(unittest.TestCase):
                 manifest_sha256='e' * 64,
                 decision_sha256=None,
                 commands=(),
+                approval_token_sha256=hashlib.sha256(('f' * 64).encode('ascii')).hexdigest(),
+                verification_report_sha256='1' * 64,
             )
             install_result = InstallResult(
                 candidate_id='cli-install',
@@ -1196,6 +1459,21 @@ class CoordinatorCliTests(unittest.TestCase):
                     'scripts.managed_update_coordinator.install_verified_candidate',
                     return_value=install_result,
                 ) as install_mock,
+                patch(
+                    'scripts.managed_update_coordinator._read_install_approval_fd',
+                    return_value=(
+                        'f' * 64,
+                        candidate.candidate_sha,
+                        verified.artifact_sha256,
+                        verified.verification_report_sha256,
+                    ),
+                ),
+                patch('scripts.managed_update_coordinator.validate_install_approval'),
+                patch(
+                    'scripts.managed_update_coordinator._hash_artifact',
+                    return_value=verified.artifact_sha256,
+                ) as artifact_hash_mock,
+                patch('scripts.managed_update_coordinator._write_installer_ready_fd'),
                 redirect_stdout(output),
             ):
                 exit_code = main(
@@ -1207,8 +1485,10 @@ class CoordinatorCliTests(unittest.TestCase):
                         str(root / 'state'),
                         '--candidate-id',
                         'cli-install',
-                        '--confirmation-token',
-                        'token-from-desktop',
+                        '--approval-fd',
+                        '3',
+                        '--ready-fd',
+                        '4',
                     ]
                 )
 
@@ -1218,10 +1498,110 @@ class CoordinatorCliTests(unittest.TestCase):
             self.assertEqual(event['candidate_id'], 'cli-install')
             self.assertEqual(event['status'], 'installed')
             self.assertEqual(event['safety_ref'], install_result.safety_ref)
+            artifact_hash_mock.assert_called_once_with(verified.artifact)
             self.assertEqual(
                 install_mock.call_args.kwargs['confirmation_token'],
-                'token-from-desktop',
+                'f' * 64,
             )
+
+            tampered_output = io.StringIO()
+            with (
+                patch(
+                    'scripts.managed_update_coordinator.load_candidate',
+                    return_value=candidate,
+                ),
+                patch(
+                    'scripts.managed_update_coordinator.load_verified_candidate',
+                    return_value=verified,
+                ),
+                patch(
+                    'scripts.managed_update_coordinator.install_verified_candidate',
+                    return_value=install_result,
+                ) as rejected_install,
+                patch(
+                    'scripts.managed_update_coordinator._read_install_approval_fd',
+                    return_value=(
+                        'f' * 64,
+                        candidate.candidate_sha,
+                        verified.artifact_sha256,
+                        '2' * 64,
+                    ),
+                ),
+                patch('scripts.managed_update_coordinator._write_installer_ready_fd') as ready_mock,
+                redirect_stdout(tampered_output),
+            ):
+                rejected_exit_code = main(
+                    [
+                        '--manifest',
+                        str(manifest_path),
+                        'install',
+                        '--state-root',
+                        str(root / 'state'),
+                        '--candidate-id',
+                        'cli-install',
+                        '--approval-fd',
+                        '3',
+                        '--ready-fd',
+                        '4',
+                    ]
+                )
+
+            self.assertEqual(rejected_exit_code, 1)
+            rejected_install.assert_not_called()
+            ready_mock.assert_not_called()
+            self.assertIn('verification report was replaced', tampered_output.getvalue())
+
+            changed_artifact_output = io.StringIO()
+            with (
+                patch(
+                    'scripts.managed_update_coordinator.load_candidate',
+                    return_value=candidate,
+                ),
+                patch(
+                    'scripts.managed_update_coordinator.load_verified_candidate',
+                    return_value=verified,
+                ),
+                patch(
+                    'scripts.managed_update_coordinator.install_verified_candidate',
+                    return_value=install_result,
+                ) as changed_artifact_install,
+                patch(
+                    'scripts.managed_update_coordinator._read_install_approval_fd',
+                    return_value=(
+                        'f' * 64,
+                        candidate.candidate_sha,
+                        verified.artifact_sha256,
+                        verified.verification_report_sha256,
+                    ),
+                ),
+                patch('scripts.managed_update_coordinator.validate_install_approval'),
+                patch(
+                    'scripts.managed_update_coordinator._hash_artifact',
+                    return_value='9' * 64,
+                ),
+                patch('scripts.managed_update_coordinator._write_installer_ready_fd') as changed_ready_mock,
+                redirect_stdout(changed_artifact_output),
+            ):
+                changed_artifact_exit_code = main(
+                    [
+                        '--manifest',
+                        str(manifest_path),
+                        'install',
+                        '--state-root',
+                        str(root / 'state'),
+                        '--candidate-id',
+                        'cli-install',
+                        '--approval-fd',
+                        '3',
+                        '--ready-fd',
+                        '4',
+                    ]
+                )
+
+            self.assertEqual(changed_artifact_exit_code, 1)
+            changed_artifact_install.assert_not_called()
+            changed_ready_mock.assert_not_called()
+            self.assertIn('artifact changed before installer readiness', changed_artifact_output.getvalue())
 
 
 if __name__ == '__main__':

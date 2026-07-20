@@ -31,6 +31,8 @@ export interface UpdateApplyState {
   command: string | null
   /** Candidate decision/confirmation data. Kept only in memory; never persisted. */
   managed: DesktopUpdateApplyResult | null
+  /** The exact managed action to retry if its IPC call fails. */
+  managedRequest: DesktopUpdateApplyOptions | null
   log: readonly { stage: DesktopUpdateStage; message: string; at: number }[]
 }
 
@@ -42,6 +44,7 @@ const IDLE: UpdateApplyState = {
   error: null,
   command: null,
   managed: null,
+  managedRequest: null,
   log: []
 }
 
@@ -374,7 +377,16 @@ export async function applyUpdates(opts: DesktopUpdateApplyOptions = {}): Promis
   }
 
   dismissNotification(UPDATE_TOAST_ID)
-  $updateApply.set({ ...IDLE, applying: true, stage: 'prepare', message: 'Starting update…' })
+  const current = $updateApply.get()
+  const managedRequest = opts.managedAction ? opts : null
+  $updateApply.set({
+    ...IDLE,
+    applying: true,
+    stage: 'prepare',
+    message: 'Starting update…',
+    managed: managedRequest ? current.managed : null,
+    managedRequest
+  })
 
   try {
     const result = await bridge.apply(opts)
@@ -392,7 +404,8 @@ export async function applyUpdates(opts: DesktopUpdateApplyOptions = {}): Promis
         applying: false,
         stage: 'managedDecision',
         message: result.message ?? 'The update candidate needs review.',
-        managed: result
+        managed: result,
+        managedRequest: null
       })
 
       return result
@@ -404,7 +417,8 @@ export async function applyUpdates(opts: DesktopUpdateApplyOptions = {}): Promis
         applying: false,
         stage: 'managedConfirmation',
         message: result.message ?? 'The verified candidate is ready for final confirmation.',
-        managed: result
+        managed: result,
+        managedRequest: null
       })
 
       return result
@@ -648,10 +662,17 @@ export async function applyBackendUpdate(): Promise<DesktopUpdateApplyResult> {
   }
 }
 
-function ingestProgress(payload: DesktopUpdateProgress): void {
+export function ingestProgress(payload: DesktopUpdateProgress): void {
   const current = $updateApply.get()
 
   if (!current.applying) {
+    return
+  }
+
+  // Decision/confirmation events intentionally arrive before the IPC result,
+  // but only that result carries the candidate capability. Keep the overlay in
+  // its non-closeable applying phase until metadata arrives atomically.
+  if (payload.stage === 'managedDecision' || payload.stage === 'managedConfirmation') {
     return
   }
 
@@ -660,8 +681,6 @@ function ingestProgress(payload: DesktopUpdateProgress): void {
   const terminal =
     payload.stage === 'error' ||
     payload.stage === 'restart' ||
-    payload.stage === 'managedDecision' ||
-    payload.stage === 'managedConfirmation' ||
     payload.stage === 'manual' ||
     payload.stage === 'guiSkew'
 
@@ -676,6 +695,7 @@ function ingestProgress(payload: DesktopUpdateProgress): void {
     // 'manual' carries the command to run in its message field.
     command: payload.stage === 'manual' ? payload.message : current.command,
     managed: current.managed,
+    managedRequest: current.managedRequest,
     log
   })
 }

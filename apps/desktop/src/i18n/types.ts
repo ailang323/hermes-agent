@@ -1621,6 +1621,7 @@ export interface Translations {
     managedRecommendations: string
     managedUpstreamEquivalentRecommendation: string
     managedUpstreamEquivalentReason: string
+    managedWorktree: string
     managedReport: string
     managedConfirmationTitle: string
     managedConfirmationBody: string
@@ -1628,6 +1629,7 @@ export interface Translations {
     managedArtifactHash: string
     managedInstallVerified: string
     managedAcceptRecommendations: string
+    managedResumeConflict: string
     managedCancel: string
     errorTitle: string
     errorBody: string

@@ -15,6 +15,7 @@ import {
   prepareManagedUpdate,
   readManagedUpdateConfiguration,
   recoverManagedUpdates,
+  resumeManagedUpdateConflict,
   runManagedUpdateCommand
 } from './managed-update'
 
@@ -63,7 +64,8 @@ test('mapManagedApplyEvent returns explicit decision and confirmation states', (
           commit_subject: 'feat(desktop): expose active locale'
         }
       ],
-      report: '/tmp/report.json'
+      report: '/tmp/report.json',
+      worktree: '/tmp/candidate/worktree'
     }),
     {
       ok: true,
@@ -79,7 +81,8 @@ test('mapManagedApplyEvent returns explicit decision and confirmation states', (
           commit_subject: 'feat(desktop): expose active locale'
         }
       ],
-      report: '/tmp/report.json'
+      report: '/tmp/report.json',
+      worktree: '/tmp/candidate/worktree'
     }
   )
   assert.deepEqual(
@@ -89,6 +92,7 @@ test('mapManagedApplyEvent returns explicit decision and confirmation states', (
       status: 'verified',
       candidate_sha: '3333333',
       artifact_sha256: 'a'.repeat(64),
+      verification_report_sha256: 'c'.repeat(64),
       confirmation_token: 'b'.repeat(64),
       report: '/tmp/verification.json'
     }),
@@ -99,6 +103,7 @@ test('mapManagedApplyEvent returns explicit decision and confirmation states', (
       candidateId: 'candidate-2',
       candidateSha: '3333333',
       artifactSha256: 'a'.repeat(64),
+      verificationReportSha256: 'c'.repeat(64),
       confirmationToken: 'b'.repeat(64),
       report: '/tmp/verification.json'
     }
@@ -164,6 +169,7 @@ test('managed service routes check and prepare with fixed coordinator arguments'
             status: 'verified',
             candidate_sha: '3333333',
             artifact_sha256: 'a'.repeat(64),
+            verification_report_sha256: 'c'.repeat(64),
             confirmation_token: 'b'.repeat(64),
             report: '/tmp/verification.json'
           }
@@ -177,18 +183,21 @@ test('managed service routes check and prepare with fixed coordinator arguments'
   const recovery = await recoverManagedUpdates(configuration, undefined, runner)
   const prepared = await prepareManagedUpdate(configuration, 'candidate-7', undefined, runner)
   const accepted = await acceptManagedUpdateReview(configuration, 'candidate-7', undefined, runner)
+  const resumed = await resumeManagedUpdateConflict(configuration, 'candidate-7', undefined, runner)
   const cancelled = await cancelManagedUpdate(configuration, 'candidate-7', undefined, runner)
 
   assert.equal(checked.behind, 2)
   assert.equal(recovery.recovered, 1)
   assert.equal(prepared.managedStage, 'confirmation')
   assert.equal(accepted.managedStage, 'confirmation')
+  assert.equal(resumed.managedStage, 'confirmation')
   assert.equal(cancelled.cancelled, true)
   assert.deepEqual(seen, [
     ['check'],
     ['recover', '--state-root', configuration.stateRoot],
     ['prepare', '--state-root', configuration.stateRoot, '--candidate-id', 'candidate-7'],
     ['accept-review', '--state-root', configuration.stateRoot, '--candidate-id', 'candidate-7'],
+    ['resume-conflict', '--state-root', configuration.stateRoot, '--candidate-id', 'candidate-7'],
     ['cancel', '--state-root', configuration.stateRoot, '--candidate-id', 'candidate-7']
   ])
 })

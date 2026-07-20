@@ -114,12 +114,18 @@ import {
   checkManagedUpdates,
   prepareManagedUpdate,
   readManagedUpdateConfiguration,
-  recoverManagedUpdates
+  recoverManagedUpdates,
+  resumeManagedUpdateConflict
 } from './managed-update'
 import {
   buildManagedUpdateConfirmationOptions,
   ManagedUpdateApprovalVault
 } from './managed-update-approval'
+import {
+  terminateManagedInstaller,
+  waitForManagedInstallerReady,
+  writeManagedInstallApproval
+} from './managed-update-handoff'
 import {
   parseManagedUpdateHealthRequest,
   publishManagedUpdateHealth
@@ -964,7 +970,7 @@ function publishManagedUpdateHealthOnce() {
   try {
     publishManagedUpdateHealth(managedUpdateHealthRequest)
     managedUpdateHealthPublished = true
-    rememberLog('Published nonce-bound managed-update startup readiness')
+    rememberLog('Published inherited-pipe managed-update startup readiness')
   } catch (error) {
     rememberLog(`Failed to publish managed-update startup readiness: ${error.message}`)
   }
@@ -1541,6 +1547,15 @@ const UPDATE_HANDOFF_DWELL_MS = 2500
 // Emits a boot-progress phase so the renderer shows "Update in progress…"
 // rather than a frozen splash. Returns true if it parked at all.
 async function waitForUpdateToFinish() {
+  // The managed installer owns the live marker and repository lock while it
+  // waits for this candidate instance to prove that its Electron shell starts.
+  // Waiting for that installer here creates a circular wait.
+  if (managedUpdateHealthRequest) {
+    rememberLog('[updates] health probe bypassing installer-owned update marker')
+
+    return false
+  }
+
   let marker = readLiveUpdateMarker(HERMES_HOME)
 
   if (!marker) {
@@ -2645,9 +2660,10 @@ function retainManagedApproval(result) {
 }
 
 async function cancelManagedCandidate(configuration, candidateId) {
+  const result = await cancelManagedUpdate(configuration, candidateId)
   managedUpdateApprovals.revoke(candidateId)
 
-  return await cancelManagedUpdate(configuration, candidateId)
+  return result
 }
 
 async function applyManagedUpdate(configuration, opts) {
@@ -2667,6 +2683,24 @@ async function applyManagedUpdate(configuration, opts) {
 
     emitUpdateProgress({
       stage: result.managedStage === 'decision' ? 'managedDecision' : 'managedConfirmation',
+      message: '',
+      percent: 100
+    })
+
+    return retainManagedApproval(result)
+  }
+
+  if (action === 'resume-conflict') {
+    const candidateId = typeof opts?.candidateId === 'string' ? opts.candidateId : ''
+
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(candidateId)) {
+      throw new Error('Managed update candidate ID is invalid.')
+    }
+
+    emitUpdateProgress({ stage: 'rebuild', message: '', percent: 65 })
+    const result = await resumeManagedUpdateConflict(configuration, candidateId)
+    emitUpdateProgress({
+      stage: 'managedConfirmation',
       message: '',
       percent: 100
     })
@@ -2714,8 +2748,6 @@ async function applyManagedUpdate(configuration, opts) {
     return await cancelManagedCandidate(configuration, candidateId)
   }
 
-  const confirmationToken = approval.confirmationToken
-
   emitUpdateProgress({ stage: 'restart', message: '', percent: 100 })
   const lock = await releaseBackendLockForUpdate(configuration.worktree)
 
@@ -2741,8 +2773,10 @@ async function applyManagedUpdate(configuration, opts) {
       configuration.stateRoot,
       '--candidate-id',
       candidateId,
-      '--confirmation-token',
-      confirmationToken,
+      '--approval-fd',
+      '3',
+      '--ready-fd',
+      '4',
       '--wait-pid',
       String(process.pid)
     ],
@@ -2751,7 +2785,7 @@ async function applyManagedUpdate(configuration, opts) {
       env: { ...process.env, HERMES_HOME },
       detached: true,
       shell: false,
-      stdio: 'ignore'
+      stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe']
     }
   )
 
@@ -2760,15 +2794,37 @@ async function applyManagedUpdate(configuration, opts) {
       child.once('spawn', resolve)
       child.once('error', reject)
     })
-  } catch (error) {
-    await cancelManagedCandidate(configuration, candidateId)
-    const detail = error instanceof Error ? error.message : String(error)
-    throw new Error(`Managed update installer did not start; the candidate was invalidated: ${detail}`)
-  }
 
-  if (!Number.isInteger(child.pid)) {
-    await cancelManagedCandidate(configuration, candidateId)
-    throw new Error('Managed update installer did not start; the candidate was invalidated.')
+    if (!Number.isInteger(child.pid)) {
+      throw new Error('installer did not receive a process ID')
+    }
+
+    await writeManagedInstallApproval(child, {
+      confirmationToken: approval.confirmationToken,
+      candidateSha: approval.candidateSha,
+      artifactSha256: approval.artifactSha256,
+      verificationReportSha256: approval.verificationReportSha256
+    })
+    await waitForManagedInstallerReady(child, candidateId)
+  } catch (error) {
+    await terminateManagedInstaller(child)
+    let cancellationError = ''
+
+    try {
+      await cancelManagedCandidate(configuration, candidateId)
+    } catch (cancelError) {
+      cancellationError = cancelError instanceof Error ? cancelError.message : String(cancelError)
+    } finally {
+      await startHermes().catch(() => {})
+    }
+
+    const detail = error instanceof Error ? error.message : String(error)
+
+    const invalidationDetail = cancellationError
+      ? ` Candidate invalidation failed: ${cancellationError}`
+      : ' The candidate was invalidated.'
+
+    throw new Error(`Managed update installer did not become ready: ${detail}${invalidationDetail}`)
   }
 
   child.unref()
@@ -8059,6 +8115,9 @@ function createWindow() {
   // shared (backendConnectionState), so the renderer's getConnection() joins
   // this in-flight boot instead of duplicating it; early boot-progress events
   // the renderer misses are recovered by its getBootProgress() pull on mount.
+  // For managed installs the nonce-bound shell ACK must be published before
+  // backend startup so a local backend cannot deadlock on the installer PID.
+  publishManagedUpdateHealthOnce()
   startHermes().catch(error => rememberLog(error.stack || error.message))
 
   mainWindow.webContents.once('did-finish-load', () => {
@@ -9970,7 +10029,9 @@ app.on('open-url', (event, url) => {
 
 app.whenReady().then(async () => {
   try {
-    if (await recoverManagedUpdateOnStartup()) {
+    // The live installer still owns this transaction and its repository lock.
+    // Only ordinary launches recover abandoned transactions.
+    if (!managedUpdateHealthRequest && (await recoverManagedUpdateOnStartup())) {
       app.relaunch()
       app.exit(0)
 

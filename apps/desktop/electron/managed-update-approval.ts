@@ -2,6 +2,7 @@ export interface ManagedApprovalResult {
   candidateId?: string
   candidateSha?: string
   artifactSha256?: string
+  verificationReportSha256?: string
   confirmationToken?: string
   [key: string]: unknown
 }
@@ -10,6 +11,7 @@ export interface ManagedApproval {
   candidateId: string
   candidateSha: string
   artifactSha256: string
+  verificationReportSha256: string
   confirmationToken: string
 }
 
@@ -21,6 +23,7 @@ export interface ManagedApprovalSummary {
   candidateId: string
   candidateSha: string
   artifactSha256: string
+  verificationReportSha256: string
 }
 
 export function buildManagedUpdateConfirmationOptions(summary: ManagedApprovalSummary, locale = 'en') {
@@ -37,11 +40,17 @@ export function buildManagedUpdateConfirmationOptions(summary: ManagedApprovalSu
       ? '这将替换当前 Hermes Desktop 应用并重新启动。'
       : 'This will replace the active Hermes Desktop bundle and restart the app.',
     detail: chinese
-      ? [`候选：${summary.candidateId}`, `提交：${summary.candidateSha}`, `制品 SHA-256：${summary.artifactSha256}`].join('\n')
+      ? [
+          `候选：${summary.candidateId}`,
+          `提交：${summary.candidateSha}`,
+          `制品 SHA-256：${summary.artifactSha256}`,
+          `验证报告 SHA-256：${summary.verificationReportSha256}`
+        ].join('\n')
       : [
           `Candidate: ${summary.candidateId}`,
           `Commit: ${summary.candidateSha}`,
-          `Artifact SHA-256: ${summary.artifactSha256}`
+          `Artifact SHA-256: ${summary.artifactSha256}`,
+          `Verification report SHA-256: ${summary.verificationReportSha256}`
         ].join('\n')
   }
 }
@@ -49,16 +58,20 @@ export function buildManagedUpdateConfirmationOptions(summary: ManagedApprovalSu
 export class ManagedUpdateApprovalVault {
   private readonly approvals = new Map<string, ManagedApproval>()
 
-  retain<T extends ManagedApprovalResult>(result: T): Omit<T, 'confirmationToken'> {
+  retain<T extends ManagedApprovalResult>(
+    result: T
+  ): Omit<T, 'confirmationToken' | 'verificationReportSha256'> {
     const candidateId = result.candidateId ?? ''
     const candidateSha = result.candidateSha ?? ''
     const artifactSha256 = result.artifactSha256 ?? ''
+    const verificationReportSha256 = result.verificationReportSha256 ?? ''
     const confirmationToken = result.confirmationToken ?? ''
 
     if (
       !CANDIDATE_ID_PATTERN.test(candidateId) ||
       !SHA_PATTERN.test(candidateSha) ||
       !HASH_PATTERN.test(artifactSha256) ||
+      !HASH_PATTERN.test(verificationReportSha256) ||
       !HASH_PATTERN.test(confirmationToken)
     ) {
       throw new Error('Managed update approval result is invalid.')
@@ -68,9 +81,15 @@ export class ManagedUpdateApprovalVault {
       candidateId,
       candidateSha,
       artifactSha256,
+      verificationReportSha256,
       confirmationToken
     })
-    const { confirmationToken: _removed, ...sanitized } = result
+
+    const {
+      confirmationToken: _removedToken,
+      verificationReportSha256: _removedReportHash,
+      ...sanitized
+    } = result
 
     return sanitized
   }
@@ -102,7 +121,8 @@ export class ManagedUpdateApprovalVault {
     const accepted = await confirm({
       candidateId: approval.candidateId,
       candidateSha: approval.candidateSha,
-      artifactSha256: approval.artifactSha256
+      artifactSha256: approval.artifactSha256,
+      verificationReportSha256: approval.verificationReportSha256
     })
 
     return accepted ? approval : null

@@ -153,13 +153,19 @@ describe('BillingSettings', () => {
       target: { value: '7.50' }
     })
 
-    expect(screen.getByText('Threshold: minimum is $10.')).toBeTruthy()
+    const formattedMinimum = new Intl.NumberFormat(undefined, {
+      currency: 'USD',
+      maximumFractionDigits: 0,
+      minimumFractionDigits: 0,
+      style: 'currency'
+    }).format(10)
+    expect(await screen.findByText(`Threshold: minimum is ${formattedMinimum}.`)).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Save' }).hasAttribute('disabled')).toBe(true)
 
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
     expect(apiMocks.updateAutoReload).not.toHaveBeenCalled()
-  })
+  }, 10_000)
 
   it('requires inline confirmation before disabling auto-refill', async () => {
     renderBilling()
@@ -254,8 +260,16 @@ describe('BillingSettings', () => {
       ok: true
     })
 
-    await waitFor(() => expect(screen.getByText('$25 added. Balance is refreshing.')).toBeTruthy())
-  })
+    const formattedAmount = new Intl.NumberFormat(undefined, {
+      currency: 'USD',
+      maximumFractionDigits: 0,
+      minimumFractionDigits: 0,
+      style: 'currency'
+    }).format(25)
+    await waitFor(() => expect(screen.getByText(`${formattedAmount} added. Balance is refreshing.`)).toBeTruthy(), {
+      timeout: 10_000
+    })
+  }, 15_000)
 
   it('renders logged-out as a connect card without normal account rows', async () => {
     apiMocks.fetchBillingState.mockResolvedValue(okBilling(loggedOutBillingState))

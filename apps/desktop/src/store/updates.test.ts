@@ -49,6 +49,7 @@ const {
   $backendUpdateApply,
   reportBackendContract,
   applyUpdates,
+  ingestProgress,
   $updateApply,
   $updateOverlayOpen,
   resetUpdateApplyState,
@@ -297,6 +298,39 @@ describe('applyUpdates terminal state', () => {
     expect(notifySpy).not.toHaveBeenCalled()
   })
 
+  it('does not expose a closeable managed terminal phase before candidate metadata arrives', async () => {
+    let resolveApply!: (value: unknown) => void
+    applyMock.mockReturnValue(new Promise(resolve => (resolveApply = resolve)))
+
+    const applying = applyUpdates()
+    ingestProgress({
+      stage: 'managedDecision',
+      message: 'Candidate needs review',
+      percent: 100,
+      error: null,
+      at: Date.now()
+    })
+
+    expect($updateApply.get()).toMatchObject({ applying: true, stage: 'prepare', managed: null })
+
+    resolveApply({
+      ok: true,
+      managed: true,
+      managedStage: 'decision',
+      candidateId: 'candidate-race',
+      decisionKind: 'conflict',
+      conflicts: ['electron/main.ts'],
+      recommendations: []
+    })
+    await applying
+
+    expect($updateApply.get()).toMatchObject({
+      applying: false,
+      stage: 'managedDecision',
+      managed: { candidateId: 'candidate-race' }
+    })
+  })
+
   it('holds a verified managed candidate for final user confirmation', async () => {
     applyMock.mockResolvedValue({
       ok: true,
@@ -333,6 +367,29 @@ describe('applyUpdates terminal state', () => {
     expect($updateOverlayOpen.get()).toBe(false)
     expect($updateApply.get()).toMatchObject({ applying: false, stage: 'idle' })
     expect(notifySpy).not.toHaveBeenCalled()
+  })
+
+  it('preserves the candidate and exact cancel request when cancellation fails', async () => {
+    applyMock.mockResolvedValueOnce({
+      ok: true,
+      managed: true,
+      managedStage: 'decision',
+      candidateId: 'candidate-cancel-retry',
+      decisionKind: 'conflict',
+      conflicts: ['electron/main.ts'],
+      recommendations: []
+    })
+    await applyUpdates()
+
+    applyMock.mockRejectedValueOnce(new Error('cancel failed'))
+    await applyUpdates({ managedAction: 'cancel', candidateId: 'candidate-cancel-retry' })
+
+    expect($updateApply.get()).toMatchObject({
+      applying: false,
+      stage: 'error',
+      managed: { candidateId: 'candidate-cancel-retry' },
+      managedRequest: { managedAction: 'cancel', candidateId: 'candidate-cancel-retry' }
+    })
   })
 
   it('holds the restart view when a relauncher hands off (no close, no toast)', async () => {
@@ -442,6 +499,7 @@ describe('applyBackendUpdate recovery', () => {
       error: null,
       command: null,
       managed: null,
+      managedRequest: null,
       log: []
     })
     vi.useFakeTimers()

@@ -54,6 +54,10 @@ export function managedCancelRequest(candidateId: string): DesktopUpdateApplyOpt
   return { managedAction: 'cancel', candidateId }
 }
 
+export function managedResumeConflictRequest(candidateId: string): DesktopUpdateApplyOptions {
+  return { managedAction: 'resume-conflict', candidateId }
+}
+
 export function UpdatesOverlay() {
   const open = useStore($updateOverlayOpen)
   const target = useStore($updateOverlayTarget)
@@ -132,6 +136,16 @@ export function UpdatesOverlay() {
     void install()
   }
 
+  const handleRetry = () => {
+    if (!isBackend && apply.managedRequest) {
+      void applyUpdates(apply.managedRequest)
+
+      return
+    }
+
+    void install()
+  }
+
   const handleManagedAcceptReview = () => {
     const candidateId = apply.managed?.candidateId
 
@@ -140,6 +154,16 @@ export function UpdatesOverlay() {
     }
 
     void applyUpdates({ managedAction: 'accept-review', candidateId })
+  }
+
+  const handleManagedResumeConflict = () => {
+    const candidateId = apply.managed?.candidateId
+
+    if (!candidateId) {
+      return
+    }
+
+    void applyUpdates(managedResumeConflictRequest(candidateId))
   }
 
   const handleManagedConfirm = () => {
@@ -157,7 +181,7 @@ export function UpdatesOverlay() {
       {/* This dialog has no inputs, so Radix's default autofocus would land on
           the close button and trigger its tooltip immediately on open. */}
       <DialogContent
-        className="max-w-sm overflow-hidden p-0 gap-0"
+        className="max-h-[85vh] max-w-sm overflow-y-auto p-0 gap-0"
         onOpenAutoFocus={preventCloseButtonAutoFocus}
         showCloseButton={phase !== 'applying'}
       >
@@ -168,6 +192,7 @@ export function UpdatesOverlay() {
             apply={apply}
             onAcceptReview={handleManagedAcceptReview}
             onCancel={() => handleClose(false)}
+            onResumeConflict={handleManagedResumeConflict}
           />
         )}
 
@@ -186,7 +211,7 @@ export function UpdatesOverlay() {
         {phase === 'guiSkew' && <GuiSkewView message={apply.message} onDone={() => handleClose(false)} />}
 
         {phase === 'error' && (
-          <ErrorView message={apply.message} onDismiss={() => handleClose(false)} onRetry={handleInstall} />
+          <ErrorView message={apply.message} onDismiss={() => handleClose(false)} onRetry={handleRetry} />
         )}
 
         {phase === 'idle' && (
@@ -341,11 +366,13 @@ function IdleView({
 export function ManagedDecisionView({
   apply,
   onAcceptReview,
-  onCancel
+  onCancel,
+  onResumeConflict
 }: {
   apply: UpdateApplyState
   onAcceptReview?: () => void
   onCancel: () => void
+  onResumeConflict?: () => void
 }) {
   const { t } = useI18n()
   const u = t.updates
@@ -402,6 +429,15 @@ export function ManagedDecisionView({
         </section>
       )}
 
+      {isConflict && managed?.worktree && (
+        <div className="grid gap-1 text-xs">
+          <span className="font-semibold text-muted-foreground">{u.managedWorktree}</span>
+          <code className="break-all rounded-md border border-border/70 bg-muted/35 px-3 py-2">
+            {managed.worktree}
+          </code>
+        </div>
+      )}
+
       {managed?.report && (
         <div className="grid gap-1 text-xs">
           <span className="font-semibold text-muted-foreground">{u.managedReport}</span>
@@ -410,6 +446,11 @@ export function ManagedDecisionView({
       )}
 
       <div className="grid gap-2">
+        {isConflict && onResumeConflict && (
+          <Button className="font-semibold" onClick={onResumeConflict} size="lg">
+            {u.managedResumeConflict}
+          </Button>
+        )}
         {!isConflict && recommendations.length > 0 && onAcceptReview && (
           <Button className="font-semibold" onClick={onAcceptReview} size="lg">
             {u.managedAcceptRecommendations}

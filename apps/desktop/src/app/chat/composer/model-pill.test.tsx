@@ -127,6 +127,7 @@ describe('ModelPill tooltip contributions', () => {
   it('renders plugin details inside the model hover tooltip', async () => {
     setCurrentModel('gpt-test')
     setCurrentProvider('openai-codex')
+
     let dispose = () => {}
     act(() => {
       dispose = registry.register({

@@ -22,56 +22,23 @@ afterEach(() => {
 })
 
 describe('managed update health protocol', () => {
-  it('accepts only a constrained health file and 64-character token in the allowed temp directory', () => {
-    const directory = makeTemporaryDirectory()
-    const file = path.join(directory, 'hermes-managed-update-health-candidate-1.json')
-    const token = 'a'.repeat(64)
-
-    expect(
-      parseManagedUpdateHealthRequest(
-        ['Hermes', '--managed-update-health-file', file, '--managed-update-health-token', token],
-        directory
-      )
-    ).toEqual({ file, token })
-    expect(
-      parseManagedUpdateHealthRequest(
-        ['Hermes', '--managed-update-health-file', path.join(directory, 'arbitrary.json'), '--managed-update-health-token', token],
-        directory
-      )
-    ).toBeNull()
-    expect(
-      parseManagedUpdateHealthRequest(
-        ['Hermes', '--managed-update-health-file', file, '--managed-update-health-token', 'short'],
-        directory
-      )
-    ).toBeNull()
-    expect(
-      parseManagedUpdateHealthRequest(
-        ['Hermes', '--managed-update-health-file', path.join(path.dirname(directory), path.basename(file)), '--managed-update-health-token', token],
-        directory
-      )
-    ).toBeNull()
+  it('accepts only a valid inherited descriptor argument', () => {
+    expect(parseManagedUpdateHealthRequest(['Hermes', '--managed-update-health-fd', '7'])).toEqual({ fd: 7 })
+    expect(parseManagedUpdateHealthRequest(['Hermes', '--managed-update-health-fd', '2'])).toBeNull()
+    expect(parseManagedUpdateHealthRequest(['Hermes', '--managed-update-health-fd', '-1'])).toBeNull()
+    expect(parseManagedUpdateHealthRequest(['Hermes', '--managed-update-health-fd', '7.5'])).toBeNull()
+    expect(parseManagedUpdateHealthRequest(['Hermes', '--managed-update-health-fd', 'not-a-fd'])).toBeNull()
+    expect(parseManagedUpdateHealthRequest(['Hermes'])).toBeNull()
   })
 
-  it('atomically publishes the nonce-bound ready record without overwriting an existing record', () => {
+  it('publishes readiness through the inherited descriptor and closes it', () => {
     const directory = makeTemporaryDirectory()
+    const file = path.join(directory, 'health-pipe-capture.json')
+    const fd = fs.openSync(file, 'w+')
 
-    const request = {
-      file: path.join(directory, 'hermes-managed-update-health-candidate-2.json'),
-      token: 'b'.repeat(64)
-    }
+    publishManagedUpdateHealth({ fd }, 1234, 5678)
 
-    publishManagedUpdateHealth(request, 1234, 5678)
-    expect(JSON.parse(fs.readFileSync(request.file, 'utf8'))).toEqual({
-      token: request.token,
-      pid: 1234,
-      readyAt: 5678
-    })
-    expect(() => publishManagedUpdateHealth(request, 9999, 9999)).toThrow()
-    expect(JSON.parse(fs.readFileSync(request.file, 'utf8'))).toEqual({
-      token: request.token,
-      pid: 1234,
-      readyAt: 5678
-    })
+    expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual({ pid: 1234, readyAt: 5678 })
+    expect(() => fs.fstatSync(fd)).toThrow()
   })
 })

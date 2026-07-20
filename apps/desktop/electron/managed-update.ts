@@ -238,7 +238,8 @@ export function mapManagedApplyEvent(event: ManagedUpdateEvent) {
       decisionKind: eventString(event, 'status'),
       conflicts: eventStringArray(event, 'conflicts'),
       recommendations: eventRecommendations(event, 'recommendations'),
-      report: eventString(event, 'report')
+      report: eventString(event, 'report'),
+      worktree: eventString(event, 'worktree')
     }
   }
 
@@ -250,6 +251,7 @@ export function mapManagedApplyEvent(event: ManagedUpdateEvent) {
       candidateId: eventString(event, 'candidate_id'),
       candidateSha: eventString(event, 'candidate_sha'),
       artifactSha256: eventString(event, 'artifact_sha256'),
+      verificationReportSha256: eventString(event, 'verification_report_sha256'),
       confirmationToken: eventString(event, 'confirmation_token'),
       report: eventString(event, 'report')
     }
@@ -424,6 +426,23 @@ export async function recoverManagedUpdates(
   }
 
   return { recovered: recovered as number, reports: reports as string[] }
+}
+
+export async function resumeManagedUpdateConflict(
+  configuration: ManagedUpdateConfiguration,
+  candidateId: string,
+  onEvent?: (event: ManagedUpdateEvent) => void,
+  runner: ManagedUpdateRunner = runManagedUpdateCommand
+) {
+  assertCandidateId(candidateId)
+
+  const events = await runner(
+    configuration,
+    ['resume-conflict', '--state-root', configuration.stateRoot, '--candidate-id', candidateId],
+    onEvent
+  )
+
+  return mapManagedApplyEvent(finalManagedEvent(events, ['candidate-ready']))
 }
 
 export async function acceptManagedUpdateReview(

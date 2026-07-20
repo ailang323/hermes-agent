@@ -8,7 +8,8 @@ import {
   managedCancelRequest,
   ManagedConfirmationView,
   ManagedDecisionView,
-  managedInstallRequest
+  managedInstallRequest,
+  managedResumeConflictRequest
 } from './updates-overlay'
 
 afterEach(() => cleanup())
@@ -22,6 +23,7 @@ function state(overrides: Partial<UpdateApplyState>): UpdateApplyState {
     error: null,
     command: null,
     managed: null,
+    managedRequest: null,
     log: [],
     ...overrides
   }
@@ -37,9 +39,15 @@ describe('managed update decision views', () => {
       managedAction: 'cancel',
       candidateId: 'candidate-2'
     })
+    expect(managedResumeConflictRequest('candidate-2')).toEqual({
+      managedAction: 'resume-conflict',
+      candidateId: 'candidate-2'
+    })
   })
 
   it('shows conflict files without exposing an install action', () => {
+    const onResumeConflict = vi.fn()
+
     const view = render(
       <Dialog open>
         <DialogContent>
@@ -53,17 +61,22 @@ describe('managed update decision views', () => {
                 decisionKind: 'conflict',
                 conflicts: ['apps/desktop/electron/main.ts'],
                 recommendations: [],
-                report: '/tmp/report.json'
+                report: '/tmp/report.json',
+                worktree: '/tmp/candidate/worktree'
               }
             })}
             onCancel={vi.fn()}
+            onResumeConflict={onResumeConflict}
           />
         </DialogContent>
       </Dialog>
     )
 
     expect(view.getByText('apps/desktop/electron/main.ts')).toBeTruthy()
+    expect(view.getByText('/tmp/candidate/worktree')).toBeTruthy()
     expect(view.queryByRole('button', { name: /install/i })).toBeNull()
+    fireEvent.click(view.getByRole('button', { name: /resolved.*continue verification/i }))
+    expect(onResumeConflict).toHaveBeenCalledTimes(1)
   })
 
   it('offers the explicit upstream-equivalent approval only for review candidates', () => {

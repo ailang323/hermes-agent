@@ -1964,6 +1964,7 @@ export const en: Translations = {
     managedRecommendations: 'Optimization recommendations',
     managedUpstreamEquivalentRecommendation: 'Use the upstream implementation for this feature.',
     managedUpstreamEquivalentReason: 'The rebased candidate no longer needs the local patch:',
+    managedWorktree: 'Conflict worktree',
     managedReport: 'Detailed report',
     managedConfirmationTitle: 'Install verified update?',
     managedConfirmationBody:
@@ -1972,6 +1973,7 @@ export const en: Translations = {
     managedArtifactHash: 'Artifact SHA-256',
     managedInstallVerified: 'Install verified update',
     managedAcceptRecommendations: 'Use upstream implementation and continue',
+    managedResumeConflict: 'Resolved — continue verification',
     managedCancel: 'Cancel',
     errorTitle: 'Update didn’t finish',
     errorBody: 'No worries — nothing was lost. You can try again now.',

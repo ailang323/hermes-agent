@@ -10,7 +10,8 @@ describe('ManagedUpdateApprovalVault', () => {
     const options = buildManagedUpdateConfirmationOptions({
       candidateId: 'candidate-dialog',
       candidateSha: '7'.repeat(40),
-      artifactSha256: '8'.repeat(64)
+      artifactSha256: '8'.repeat(64),
+      verificationReportSha256: '9'.repeat(64)
     })
 
     expect(options).toMatchObject({
@@ -29,7 +30,8 @@ describe('ManagedUpdateApprovalVault', () => {
       {
         candidateId: 'candidate-dialog-zh',
         candidateSha: '9'.repeat(40),
-        artifactSha256: 'a'.repeat(64)
+        artifactSha256: 'a'.repeat(64),
+        verificationReportSha256: 'b'.repeat(64)
       },
       'zh-CN'
     )
@@ -43,6 +45,7 @@ describe('ManagedUpdateApprovalVault', () => {
     expect(options.detail).toContain('候选：candidate-dialog-zh')
     expect(options.detail).toContain('提交：')
     expect(options.detail).toContain('制品 SHA-256：')
+    expect(options.detail).toContain('验证报告 SHA-256：')
   })
 
   it('keeps the approval token in main-only state and strips it from renderer data', () => {
@@ -54,16 +57,19 @@ describe('ManagedUpdateApprovalVault', () => {
       candidateId: 'desktop-1234-abcd',
       candidateSha: 'c'.repeat(40),
       artifactSha256: 'd'.repeat(64),
+      verificationReportSha256: 'f'.repeat(64),
       confirmationToken: 'e'.repeat(64)
     }
 
     const sanitized = vault.retain(result)
 
     expect(sanitized).not.toHaveProperty('confirmationToken')
+    expect(sanitized).not.toHaveProperty('verificationReportSha256')
     expect(vault.peek(result.candidateId)).toEqual({
       candidateId: result.candidateId,
       candidateSha: result.candidateSha,
       artifactSha256: result.artifactSha256,
+      verificationReportSha256: result.verificationReportSha256,
       confirmationToken: result.confirmationToken
     })
   })
@@ -75,6 +81,7 @@ describe('ManagedUpdateApprovalVault', () => {
       candidateId: 'candidate-one',
       candidateSha: 'a'.repeat(40),
       artifactSha256: 'b'.repeat(64),
+      verificationReportSha256: 'd'.repeat(64),
       confirmationToken: 'c'.repeat(64)
     }
 
@@ -82,6 +89,7 @@ describe('ManagedUpdateApprovalVault', () => {
       candidateId: 'candidate-two',
       candidateSha: 'd'.repeat(40),
       artifactSha256: 'e'.repeat(64),
+      verificationReportSha256: '0'.repeat(64),
       confirmationToken: 'f'.repeat(64)
     }
 
@@ -100,6 +108,7 @@ describe('ManagedUpdateApprovalVault', () => {
       candidateId: 'candidate-authorize',
       candidateSha: '1'.repeat(40),
       artifactSha256: '2'.repeat(64),
+      verificationReportSha256: '4'.repeat(64),
       confirmationToken: '3'.repeat(64)
     }
 
@@ -109,7 +118,8 @@ describe('ManagedUpdateApprovalVault', () => {
       expect(summary).toEqual({
         candidateId: approval.candidateId,
         candidateSha: approval.candidateSha,
-        artifactSha256: approval.artifactSha256
+        artifactSha256: approval.artifactSha256,
+        verificationReportSha256: approval.verificationReportSha256
       })
       expect(summary).not.toHaveProperty('confirmationToken')
 
@@ -127,6 +137,7 @@ describe('ManagedUpdateApprovalVault', () => {
       candidateId: 'candidate-cancel',
       candidateSha: '4'.repeat(40),
       artifactSha256: '5'.repeat(64),
+      verificationReportSha256: '7'.repeat(64),
       confirmationToken: '6'.repeat(64)
     }
 
@@ -144,6 +155,7 @@ describe('ManagedUpdateApprovalVault', () => {
         candidateId: '../escape',
         candidateSha: 'a'.repeat(40),
         artifactSha256: 'b'.repeat(64),
+        verificationReportSha256: 'd'.repeat(64),
         confirmationToken: 'c'.repeat(64)
       })
     ).toThrow('invalid')

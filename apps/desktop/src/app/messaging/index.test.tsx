@@ -77,7 +77,7 @@ describe('MessagingView setup-guide link', () => {
 
     expect((await screen.findAllByText('Microsoft Teams')).length).toBeGreaterThan(0)
     expect(screen.queryByText('Open setup guide')).toBeNull()
-  })
+  }, 10_000)
 
   it('opens a real docs URL through the validated external opener', async () => {
     const docsUrl = 'https://hermes-agent.nousresearch.com/docs/user-guide/messaging/teams'

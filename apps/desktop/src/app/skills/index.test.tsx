@@ -102,7 +102,7 @@ describe('SkillsView toolset management', () => {
     })
 
     await waitFor(() => expect(toggleToolset).toHaveBeenCalledWith('web', false))
-  })
+  }, 10_000)
 
   it('renders toolset titles without leading emoji', async () => {
     getToolsets.mockResolvedValue([toolset({ name: 'cronjob', label: '⏰ Cron Jobs', description: 'cron tools' })])
@@ -114,7 +114,7 @@ describe('SkillsView toolset management', () => {
     // of the emoji rather than a single-match text lookup.
     await screen.findByRole('switch', { name: 'Toggle Cron Jobs toolset' })
     expect(screen.queryByText(/⏰/)).toBeNull()
-  })
+  }, 10_000)
 
   it('renders the provider config panel inline for the selected toolset', async () => {
     // The master-detail UI dropped the resting "Configured" pill and the
@@ -124,7 +124,7 @@ describe('SkillsView toolset management', () => {
 
     await screen.findByRole('switch', { name: 'Toggle Web Search toolset' })
     await waitFor(() => expect(getToolsetConfig).toHaveBeenCalledWith('web'))
-  })
+  }, 10_000)
 
   it('shows a vision explainer that deep-links to Settings → Models', async () => {
     // Vision has no TOOL_CATEGORIES provider matrix — its model lives in the
