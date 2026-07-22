@@ -1026,6 +1026,21 @@ class CandidateInstallationTests(unittest.TestCase):
             def copy_test_bundle(source: Path, target: Path) -> None:
                 shutil.copytree(source, target, symlinks=True)
 
+            def install_current_candidate() -> InstallResult:
+                return install_verified_candidate(
+                    manifest,
+                    candidate,
+                    verified,
+                    confirmation_token=approval_token(manifest, candidate, verified),
+                    confirmed_candidate_sha=candidate.candidate_sha,
+                    confirmed_artifact_sha256=verified.artifact_sha256,
+                    copy_bundle=copy_test_bundle,
+                    health_check=lambda target: (target / 'marker.txt').read_text(
+                        encoding='utf-8'
+                    )
+                    == 'new\n',
+                )
+
             other_app = root / 'Applications' / 'Other.app'
             other_app.mkdir()
             (other_app / 'version.txt').write_text('unrelated\n', encoding='utf-8')
@@ -1047,33 +1062,93 @@ class CandidateInstallationTests(unittest.TestCase):
             forged_recovery = state_dir / 'recovery.json'
             forged_recovery.write_text('{"schema":1,"status":"rolled-back"}', encoding='utf-8')
             with self.assertRaisesRegex(ManifestError, 'pre-existing install or recovery report'):
-                install_verified_candidate(
-                    manifest,
-                    candidate,
-                    verified,
-                    confirmation_token=approval_token(manifest, candidate, verified),
-                    confirmed_candidate_sha=candidate.candidate_sha,
-                    confirmed_artifact_sha256=verified.artifact_sha256,
-                    copy_bundle=copy_test_bundle,
-                    health_check=lambda _target: True,
-                )
+                install_current_candidate()
             forged_recovery.unlink()
 
-            installed = install_verified_candidate(
-                manifest,
-                candidate,
-                verified,
-                confirmation_token=approval_token(manifest, candidate, verified),
-                confirmed_candidate_sha=candidate.candidate_sha,
-                confirmed_artifact_sha256=verified.artifact_sha256,
-                copy_bundle=copy_test_bundle,
-                health_check=lambda target: (target / 'marker.txt').read_text(
-                    encoding='utf-8'
-                )
-                == 'new\n',
+            prior_state = state_dir.parent / 'candidate-prior'
+            prior_state.mkdir()
+            prior_transaction_path = prior_state / 'transaction.json'
+            prior_transaction_path.write_text(
+                json.dumps({'started_at': 123}), encoding='utf-8'
             )
+            with self.assertRaisesRegex(ManifestError, 'invalid install transaction journal'):
+                install_current_candidate()
+            self.assertFalse((state_dir / 'transaction.json').exists())
+
+            prior_id = prior_state.name
+            original_artifact_sha256 = _hash_artifact(installed_app)
+            prior_transaction_path.write_text(
+                json.dumps(
+                    {
+                        'schema': 1,
+                        'status': 'installing',
+                        'candidate_id': prior_id,
+                        'manifest_sha256': 'a' * 64,
+                        'original_sha': original_sha,
+                        'candidate_sha': candidate_sha,
+                        'target': str(installed_app),
+                        'staged': str(
+                            installed_app.with_name(f'.Hermes.install-{prior_id}.app')
+                        ),
+                        'backup': str(
+                            installed_app.with_name(f'.Hermes.rollback-{prior_id}.app')
+                        ),
+                        'original_artifact_sha256': original_artifact_sha256,
+                        'candidate_artifact_sha256': verified.artifact_sha256,
+                        'started_at': 123,
+                    }
+                ),
+                encoding='utf-8',
+            )
+            self.assertFalse((state_dir / 'transaction.json').exists())
+            before_head = git(active, 'rev-parse', 'HEAD')
+            before_app_hash = _hash_artifact(installed_app)
+
+            with self.assertRaisesRegex(ManifestError, 'manifest does not match'):
+                install_current_candidate()
+            self.assertFalse((state_dir / 'transaction.json').exists())
+
+            prior_recovery_path = prior_state / 'recovery.json'
+            prior_recovery_path.write_text('{}', encoding='utf-8')
+            with self.assertRaisesRegex(ManifestError, 'invalid install recovery report'):
+                install_current_candidate()
+            self.assertFalse((state_dir / 'transaction.json').exists())
+
+            prior_recovery_path.write_text(
+                json.dumps(
+                    {
+                        'schema': 1,
+                        'status': 'rolled-back',
+                        'candidate_id': prior_id,
+                        'original_sha': original_sha,
+                        'candidate_sha': candidate_sha,
+                        'original_artifact_sha256': original_artifact_sha256,
+                        'candidate_artifact_sha256': verified.artifact_sha256,
+                        'recovered_at': 123,
+                    }
+                ),
+                encoding='utf-8',
+            )
+            prior_install_path = prior_state / 'install.json'
+            prior_install_path.write_text('{}', encoding='utf-8')
+            with self.assertRaisesRegex(ManifestError, 'not uniquely terminal'):
+                install_current_candidate()
+            prior_install_path.unlink()
+
+            self.assertEqual(git(active, 'rev-parse', 'HEAD'), before_head)
+            self.assertEqual(_hash_artifact(installed_app), before_app_hash)
+            self.assertFalse((state_dir / 'transaction.json').exists())
+            with (
+                patch.object(coordinator.time, 'time', return_value=123),
+                patch.object(coordinator.time, 'time_ns', return_value=123),
+            ):
+                installed = install_current_candidate()
 
             self.assertEqual(installed.status, 'installed')
+            transaction = json.loads(
+                (state_dir / 'transaction.json').read_text(encoding='utf-8')
+            )
+            self.assertGreater(transaction['started_at'], 123)
             self.assertEqual(git(active, 'rev-parse', 'HEAD'), candidate_sha)
             self.assertEqual((installed_app / 'marker.txt').read_text(encoding='utf-8'), 'new\n')
             self.assertEqual(git(active, 'rev-parse', installed.safety_ref), original_sha)
@@ -1082,8 +1157,37 @@ class CandidateInstallationTests(unittest.TestCase):
                 (installed.backup_path / 'marker.txt').read_text(encoding='utf-8'),
                 'old\n',
             )
-            transaction = json.loads((state_dir / 'transaction.json').read_text(encoding='utf-8'))
+            transaction_path = state_dir / 'transaction.json'
+            transaction = json.loads(transaction_path.read_text(encoding='utf-8'))
             self.assertEqual(transaction['status'], 'installing')
+
+            transaction_without_started_at = dict(transaction)
+            transaction_without_started_at.pop('started_at')
+            transaction_path.chmod(0o600)
+            transaction_path.write_text(
+                json.dumps(transaction_without_started_at), encoding='utf-8'
+            )
+            with self.assertRaisesRegex(ManifestError, 'started_at'):
+                recover_install_transaction(manifest, state_dir)
+            transaction_path.write_text(json.dumps(transaction), encoding='utf-8')
+
+            install_report_path = state_dir / 'install.json'
+            install_report = json.loads(install_report_path.read_text(encoding='utf-8'))
+            install_report_path.chmod(0o600)
+            invalid_safety_report = dict(install_report)
+            invalid_safety_report['safety_ref'] = 'refs/hermes-managed-update/safety/wrong'
+            install_report_path.write_text(
+                json.dumps(invalid_safety_report), encoding='utf-8'
+            )
+            with self.assertRaisesRegex(ManifestError, 'invalid committed install report'):
+                recover_install_transaction(manifest, state_dir)
+            install_report_path.write_text(json.dumps(install_report), encoding='utf-8')
+
+            git(active, 'update-ref', installed.safety_ref, candidate_sha)
+            with self.assertRaisesRegex(ManifestError, 'safety ref'):
+                recover_install_transaction(manifest, state_dir)
+            git(active, 'update-ref', installed.safety_ref, original_sha)
+
             self.assertEqual(
                 recover_install_transaction(manifest, state_dir).resolve(),
                 (state_dir / 'install.json').resolve(),
@@ -1091,10 +1195,432 @@ class CandidateInstallationTests(unittest.TestCase):
             self.assertEqual(git(active, 'rev-parse', 'HEAD'), candidate_sha)
             self.assertEqual((installed_app / 'marker.txt').read_text(encoding='utf-8'), 'new\n')
 
+            recovery_report = {
+                'schema': 1,
+                'status': 'rolled-back',
+                'candidate_id': candidate.candidate_id,
+                'original_sha': transaction['original_sha'],
+                'candidate_sha': transaction['candidate_sha'],
+                'original_artifact_sha256': transaction['original_artifact_sha256'],
+                'candidate_artifact_sha256': transaction['candidate_artifact_sha256'],
+                'recovered_at': 1,
+            }
+            (state_dir / 'recovery.json').write_text(
+                json.dumps(recovery_report), encoding='utf-8'
+            )
+            with self.assertRaisesRegex(
+                ManifestError, 'install transaction is not uniquely terminal'
+            ):
+                recover_install_transaction(manifest, state_dir)
+
 
 class InstallRecoveryTests(unittest.TestCase):
+    def test_recovery_holds_repository_lock_while_discovering_transactions(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp:
+            root = Path(raw_temp)
+            active = root / 'active'
+            state_dir = root / 'state' / 'candidate-lock-probe'
+            active.mkdir()
+            state_dir.mkdir(parents=True)
+            git(active, 'init', '-b', 'feat/longer-stable-v2')
+            git(active, 'config', 'user.name', 'Managed Update Test')
+            git(active, 'config', 'user.email', 'managed-update@example.invalid')
+            (active / 'base.txt').write_text('base\n', encoding='utf-8')
+            git(active, 'add', 'base.txt')
+            git(active, 'commit', '-m', 'base')
+            manifest = ManagedUpdateManifest(
+                schema=1,
+                mode='managed-patch-stack',
+                worktree=active,
+                branch='feat/longer-stable-v2',
+                upstream='upstream/main',
+                installed_app=root / 'Applications' / 'Hermes.app',
+                features=(),
+                verification_commands=(),
+                artifact=None,
+            )
+            (state_dir / 'transaction.json').write_text('{}', encoding='utf-8')
+            common_dir = Path(
+                git(active, 'rev-parse', '--path-format=absolute', '--git-common-dir')
+            )
+            lock_path = common_dir / 'hermes-managed-update.lock'
+            original_read_json_object = coordinator._read_json_object
+
+            def probe_lock(path: Path) -> dict[str, object]:
+                if Path(path).resolve() == (state_dir / 'transaction.json').resolve():
+                    probe = subprocess.run(
+                        [
+                            sys.executable,
+                            '-c',
+                            (
+                                'import fcntl, os, sys; '
+                                'fd=os.open(sys.argv[1], os.O_RDWR|os.O_CREAT, 0o600); '
+                                'result=0; '
+                                '\ntry: fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB)'
+                                '\nexcept BlockingIOError: result=75'
+                                '\nos.close(fd); sys.exit(result)'
+                            ),
+                            str(lock_path),
+                        ],
+                        check=False,
+                    )
+                    self.assertEqual(
+                        probe.returncode,
+                        75,
+                        'transaction discovery ran outside the repository update lock',
+                    )
+                    raise RuntimeError('lock probe complete')
+                return original_read_json_object(path)
+
+            with patch.object(coordinator, '_read_json_object', side_effect=probe_lock):
+                with self.assertRaisesRegex(RuntimeError, 'lock probe complete'):
+                    recover_pending_install_transactions(manifest, state_dir.parent)
+
+    def test_pending_recovery_ignores_current_manifest_after_valid_rollback_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp:
+            root = Path(raw_temp)
+            active = root / 'active'
+            target = root / 'Applications' / 'Hermes.app'
+            state_root = root / 'state'
+            state_dir = state_root / 'candidate-rolled-back'
+            active.mkdir()
+            target.mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+            (target / 'marker.txt').write_text('old\n', encoding='utf-8')
+
+            git(active, 'init', '-b', 'feat/longer-stable-v2')
+            git(active, 'config', 'user.name', 'Managed Update Test')
+            git(active, 'config', 'user.email', 'managed-update@example.invalid')
+            (active / 'version.txt').write_text('old\n', encoding='utf-8')
+            git(active, 'add', 'version.txt')
+            git(active, 'commit', '-m', 'original')
+            original_sha = git(active, 'rev-parse', 'HEAD')
+            (active / 'version.txt').write_text('new\n', encoding='utf-8')
+            git(active, 'commit', '-am', 'candidate')
+            candidate_sha = git(active, 'rev-parse', 'HEAD')
+            git(active, 'reset', '--hard', original_sha)
+
+            manifest = ManagedUpdateManifest(
+                schema=1,
+                mode='managed-patch-stack',
+                worktree=active,
+                branch='feat/longer-stable-v2',
+                upstream='upstream/main',
+                installed_app=target,
+                features=(),
+                verification_commands=(),
+                artifact=None,
+            )
+            original_hash = _hash_artifact(target)
+            candidate_bundle = root / 'candidate.app'
+            candidate_bundle.mkdir()
+            (candidate_bundle / 'marker.txt').write_text('new\n', encoding='utf-8')
+            candidate_hash = _hash_artifact(candidate_bundle)
+            shutil.rmtree(candidate_bundle)
+
+            transaction = {
+                'schema': 1,
+                'status': 'installing',
+                'candidate_id': state_dir.name,
+                'manifest_sha256': manifest_digest(manifest),
+                'original_sha': original_sha,
+                'candidate_sha': candidate_sha,
+                'target': str(target),
+                'staged': str(target.with_name(f'.Hermes.install-{state_dir.name}.app')),
+                'backup': str(target.with_name(f'.Hermes.rollback-{state_dir.name}.app')),
+                'original_artifact_sha256': original_hash,
+                'candidate_artifact_sha256': candidate_hash,
+                'started_at': 1,
+            }
+            (state_dir / 'transaction.json').write_text(
+                json.dumps(transaction), encoding='utf-8'
+            )
+            recovery_report = {
+                'schema': 1,
+                'status': 'rolled-back',
+                'candidate_id': state_dir.name,
+                'original_sha': original_sha,
+                'candidate_sha': candidate_sha,
+                'original_artifact_sha256': original_hash,
+                'candidate_artifact_sha256': candidate_hash,
+                'recovered_at': 1,
+            }
+            recovery_path = state_dir / 'recovery.json'
+            recovery_path.write_text(json.dumps(recovery_report), encoding='utf-8')
+
+            evolved_manifest = replace(manifest, upstream='upstream/next')
+            self.assertEqual(
+                recover_pending_install_transactions(evolved_manifest, state_root),
+                (),
+            )
+            with self.assertRaisesRegex(ManifestError, 'manifest does not match'):
+                recover_install_transaction(evolved_manifest, state_dir)
+
+            before_head = git(active, 'rev-parse', 'HEAD')
+            before_target_hash = _hash_artifact(target)
+
+            recovery_path.unlink()
+            with self.assertRaisesRegex(ManifestError, 'manifest does not match'):
+                recover_pending_install_transactions(evolved_manifest, state_root)
+
+            malformed_recovery = dict(recovery_report)
+            malformed_recovery['candidate_sha'] = 'f' * 40
+            recovery_path.write_text(json.dumps(malformed_recovery), encoding='utf-8')
+            with self.assertRaisesRegex(ManifestError, 'invalid install recovery report'):
+                recover_pending_install_transactions(evolved_manifest, state_root)
+
+            recovery_path.write_text(json.dumps(recovery_report), encoding='utf-8')
+            (state_dir / 'install.json').write_text('{}', encoding='utf-8')
+            with self.assertRaisesRegex(ManifestError, 'not uniquely terminal'):
+                recover_pending_install_transactions(evolved_manifest, state_root)
+
+            self.assertEqual(git(active, 'rev-parse', 'HEAD'), before_head)
+            self.assertEqual(_hash_artifact(target), before_target_hash)
+            self.assertFalse(Path(transaction['staged']).exists())
+            self.assertFalse(Path(transaction['backup']).exists())
+
+    def test_recovery_treats_older_committed_install_as_historical(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp:
+            root = Path(raw_temp)
+            active = root / 'active'
+            target = root / 'Applications' / 'Hermes.app'
+            state_root = root / 'state'
+            active.mkdir()
+            target.mkdir(parents=True)
+            state_root.mkdir()
+            (target / 'marker.txt').write_text('second\n', encoding='utf-8')
+
+            git(active, 'init', '-b', 'feat/longer-stable-v2')
+            git(active, 'config', 'user.name', 'Managed Update Test')
+            git(active, 'config', 'user.email', 'managed-update@example.invalid')
+            (active / 'version.txt').write_text('original\n', encoding='utf-8')
+            git(active, 'add', 'version.txt')
+            git(active, 'commit', '-m', 'original')
+            original_sha = git(active, 'rev-parse', 'HEAD')
+            (active / 'version.txt').write_text('first\n', encoding='utf-8')
+            git(active, 'commit', '-am', 'first candidate')
+            first_sha = git(active, 'rev-parse', 'HEAD')
+            (active / 'version.txt').write_text('second\n', encoding='utf-8')
+            git(active, 'commit', '-am', 'second candidate')
+            second_sha = git(active, 'rev-parse', 'HEAD')
+
+            manifest_path = root / 'manifest.json'
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        'schema': 1,
+                        'mode': 'managed-patch-stack',
+                        'worktree': str(active),
+                        'branch': 'feat/longer-stable-v2',
+                        'upstream': 'upstream/main',
+                        'installed_app': str(target),
+                        'features': [],
+                    }
+                ),
+                encoding='utf-8',
+            )
+            manifest = load_manifest(manifest_path)
+
+            # Lexical order intentionally opposes chronological order. Recovery
+            # must select by the immutable started_at field.
+            first_state = state_root / 'candidate-z-historical'
+            second_state = state_root / 'candidate-a-current'
+            first_state.mkdir()
+            second_state.mkdir()
+            first_backup = target.with_name(f'.Hermes.rollback-{first_state.name}.app')
+            second_backup = target.with_name(f'.Hermes.rollback-{second_state.name}.app')
+            first_backup.mkdir()
+            second_backup.mkdir()
+            (first_backup / 'marker.txt').write_text('original\n', encoding='utf-8')
+            (second_backup / 'marker.txt').write_text('first\n', encoding='utf-8')
+            original_hash = _hash_artifact(first_backup)
+            first_hash = _hash_artifact(second_backup)
+            second_hash = _hash_artifact(target)
+
+            def write_committed_transaction(
+                state_dir: Path,
+                *,
+                started_at: int,
+                original_commit: str,
+                candidate_commit: str,
+                original_artifact: str,
+                candidate_artifact: str,
+                backup: Path,
+            ) -> None:
+                candidate_id = state_dir.name
+                (state_dir / 'transaction.json').write_text(
+                    json.dumps(
+                        {
+                            'schema': 1,
+                            'status': 'installing',
+                            'candidate_id': candidate_id,
+                            'manifest_sha256': manifest_digest(manifest),
+                            'original_sha': original_commit,
+                            'candidate_sha': candidate_commit,
+                            'target': str(target),
+                            'staged': str(
+                                target.with_name(f'.Hermes.install-{candidate_id}.app')
+                            ),
+                            'backup': str(backup),
+                            'original_artifact_sha256': original_artifact,
+                            'candidate_artifact_sha256': candidate_artifact,
+                            'started_at': started_at,
+                        }
+                    ),
+                    encoding='utf-8',
+                )
+                (state_dir / 'install.json').write_text(
+                    json.dumps(
+                        {
+                            'schema': 1,
+                            'status': 'installed',
+                            'candidate_id': candidate_id,
+                            'original_sha': original_commit,
+                            'candidate_sha': candidate_commit,
+                            'artifact_sha256': candidate_artifact,
+                            'safety_ref': f'refs/hermes-managed-update/safety/{candidate_id}',
+                        }
+                    ),
+                    encoding='utf-8',
+                )
+                git(
+                    active,
+                    'update-ref',
+                    f'refs/hermes-managed-update/safety/{candidate_id}',
+                    original_commit,
+                )
+
+            write_committed_transaction(
+                first_state,
+                started_at=1,
+                original_commit=original_sha,
+                candidate_commit=first_sha,
+                original_artifact=original_hash,
+                candidate_artifact=first_hash,
+                backup=first_backup,
+            )
+            write_committed_transaction(
+                second_state,
+                started_at=2,
+                original_commit=first_sha,
+                candidate_commit=second_sha,
+                original_artifact=first_hash,
+                candidate_artifact=second_hash,
+                backup=second_backup,
+            )
+
+            # Historical transaction metadata remains immutable evidence, but
+            # its old manifest/path and retired rollback bundle are not live
+            # authority for the latest installed generation.
+            historical_transaction_path = first_state / 'transaction.json'
+            historical_transaction = json.loads(
+                historical_transaction_path.read_text(encoding='utf-8')
+            )
+            retired_target = root / 'Retired Applications' / 'Hermes.app'
+            historical_transaction.update(
+                {
+                    'manifest_sha256': 'a' * 64,
+                    'target': str(retired_target),
+                    'staged': str(
+                        retired_target.with_name(
+                            f'.Hermes.install-{first_state.name}.app'
+                        )
+                    ),
+                    'backup': str(
+                        retired_target.with_name(
+                            f'.Hermes.rollback-{first_state.name}.app'
+                        )
+                    ),
+                }
+            )
+            historical_transaction_path.write_text(
+                json.dumps(historical_transaction), encoding='utf-8'
+            )
+            shutil.rmtree(first_backup)
+
+            evolved_manifest = replace(manifest, upstream='upstream/next')
+            self.assertEqual(
+                recover_pending_install_transactions(evolved_manifest, state_root), ()
+            )
+            self.assertEqual(git(active, 'rev-parse', 'HEAD'), second_sha)
+            self.assertEqual((target / 'marker.txt').read_text(encoding='utf-8'), 'second\n')
+            with self.assertRaisesRegex(ManifestError, 'not the latest install transaction'):
+                recover_install_transaction(manifest, first_state)
+
+            baseline_historical_transaction = json.loads(
+                historical_transaction_path.read_text(encoding='utf-8')
+            )
+            invalid_started_at_cases = (
+                ('missing', None, 'started_at is invalid'),
+                ('boolean', True, 'started_at is invalid'),
+                ('negative', -1, 'started_at is invalid'),
+                ('string', '1', 'started_at is invalid'),
+                ('duplicate', 2, 'ambiguous started_at ordering'),
+            )
+            for case_name, invalid_value, expected_error in invalid_started_at_cases:
+                with self.subTest(started_at=case_name):
+                    invalid_transaction = dict(baseline_historical_transaction)
+                    if case_name == 'missing':
+                        invalid_transaction.pop('started_at')
+                    else:
+                        invalid_transaction['started_at'] = invalid_value
+                    historical_transaction_path.write_text(
+                        json.dumps(invalid_transaction), encoding='utf-8'
+                    )
+                    with self.assertRaisesRegex(ManifestError, expected_error):
+                        recover_pending_install_transactions(manifest, state_root)
+            historical_transaction_path.write_text(
+                json.dumps(baseline_historical_transaction), encoding='utf-8'
+            )
+
+            historical_install_path = first_state / 'install.json'
+            historical_install = json.loads(
+                historical_install_path.read_text(encoding='utf-8')
+            )
+            historical_recovery_path = first_state / 'recovery.json'
+            historical_recovery_path.write_text(
+                json.dumps(
+                    {
+                        'schema': 1,
+                        'status': 'rolled-back',
+                        'candidate_id': first_state.name,
+                        'original_sha': original_sha,
+                        'candidate_sha': first_sha,
+                        'original_artifact_sha256': original_hash,
+                        'candidate_artifact_sha256': first_hash,
+                        'recovered_at': 1,
+                    }
+                ),
+                encoding='utf-8',
+            )
+            with self.assertRaisesRegex(
+                ManifestError, 'historical install transaction is not uniquely terminal'
+            ):
+                recover_pending_install_transactions(manifest, state_root)
+            historical_recovery_path.unlink()
+            historical_install_path.unlink()
+            with self.assertRaisesRegex(
+                ManifestError, 'historical install transaction is not uniquely terminal'
+            ):
+                recover_pending_install_transactions(manifest, state_root)
+            historical_install_path.write_text(
+                json.dumps(historical_install), encoding='utf-8'
+            )
+
+            tampered_historical = json.loads(
+                historical_install_path.read_text(encoding='utf-8')
+            )
+            tampered_historical['candidate_sha'] = 'f' * 40
+            (first_state / 'install.json').write_text(
+                json.dumps(tampered_historical), encoding='utf-8'
+            )
+            with self.assertRaisesRegex(
+                ManifestError, 'invalid historical install transaction report'
+            ):
+                recover_pending_install_transactions(manifest, state_root)
+
     def test_recovery_rolls_back_git_only_and_app_exchanged_crash_states(self) -> None:
-        for crash_state in ('git-promoted', 'app-exchanged'):
+        for crash_state in ('git-promoted', 'app-exchanged', 'unrelated-head'):
             with self.subTest(crash_state=crash_state), tempfile.TemporaryDirectory() as raw_temp:
                 root = Path(raw_temp)
                 active = root / 'active'
@@ -1117,6 +1643,12 @@ class InstallRecoveryTests(unittest.TestCase):
                 git(active, 'add', 'candidate.txt')
                 git(active, 'commit', '-m', 'candidate')
                 candidate_sha = git(active, 'rev-parse', 'HEAD')
+                unrelated_sha = None
+                if crash_state == 'unrelated-head':
+                    (active / 'unrelated.txt').write_text('unrelated\n', encoding='utf-8')
+                    git(active, 'add', 'unrelated.txt')
+                    git(active, 'commit', '-m', 'unrelated')
+                    unrelated_sha = git(active, 'rev-parse', 'HEAD')
                 manifest_path = root / 'manifest.json'
                 manifest_path.write_text(
                     json.dumps(
@@ -1161,10 +1693,32 @@ class InstallRecoveryTests(unittest.TestCase):
                             'backup': str(backup),
                             'original_artifact_sha256': old_hash,
                             'candidate_artifact_sha256': new_hash,
+                            'started_at': 1,
                         }
                     ),
                     encoding='utf-8',
                 )
+
+                if crash_state == 'unrelated-head':
+                    before = {
+                        path: _hash_artifact(path) if path.exists() else None
+                        for path in (target, staged, backup)
+                    }
+                    with self.assertRaisesRegex(
+                        ManifestError,
+                        'active Git HEAD matches neither side of the install transaction',
+                    ):
+                        recover_pending_install_transactions(manifest, root / 'state')
+                    self.assertEqual(git(active, 'rev-parse', 'HEAD'), unrelated_sha)
+                    self.assertEqual(
+                        before,
+                        {
+                            path: _hash_artifact(path) if path.exists() else None
+                            for path in (target, staged, backup)
+                        },
+                    )
+                    self.assertFalse((state_dir / 'recovery.json').exists())
+                    continue
 
                 reports = recover_pending_install_transactions(manifest, root / 'state')
                 self.assertEqual(len(reports), 1)
@@ -1177,9 +1731,17 @@ class InstallRecoveryTests(unittest.TestCase):
                 self.assertFalse(backup.exists())
                 self.assertEqual(json.loads(report.read_text(encoding='utf-8'))['status'], 'rolled-back')
 
-                tampered = json.loads(report.read_text(encoding='utf-8'))
-                tampered['candidate_sha'] = 'f' * 40
+                recovered = json.loads(report.read_text(encoding='utf-8'))
+                invalid_recovered_at = dict(recovered)
+                invalid_recovered_at['recovered_at'] = '1'
                 report.chmod(0o600)
+                report.write_text(json.dumps(invalid_recovered_at), encoding='utf-8')
+                with self.assertRaisesRegex(ManifestError, 'invalid install recovery report'):
+                    recover_pending_install_transactions(manifest, root / 'state')
+                report.write_text(json.dumps(recovered), encoding='utf-8')
+
+                tampered = dict(recovered)
+                tampered['candidate_sha'] = 'f' * 40
                 report.write_text(json.dumps(tampered), encoding='utf-8')
                 with self.assertRaisesRegex(ManifestError, 'invalid install recovery report'):
                     recover_pending_install_transactions(manifest, root / 'state')

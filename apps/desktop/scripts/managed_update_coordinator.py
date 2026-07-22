@@ -1441,172 +1441,397 @@ def _transaction_path(value: Any, field: str) -> Path:
     return Path(value).expanduser().resolve()
 
 
+@dataclass(frozen=True)
+class _InstallTransactionMetadata:
+    candidate_id: str
+    manifest_sha256: str
+    original_sha: str
+    candidate_sha: str
+    target: Path
+    staged: Path
+    backup: Path
+    original_artifact_sha256: str
+    candidate_artifact_sha256: str
+    started_at: int
+
+
+def _validate_install_transaction_metadata(
+    state_dir: Path,
+    transaction: dict[str, Any],
+    *,
+    context: str = 'install transaction',
+) -> _InstallTransactionMetadata:
+    state_dir = Path(state_dir).resolve()
+    if transaction.get('schema') != 1 or transaction.get('status') != 'installing':
+        raise ManifestError(f'invalid {context} journal')
+    candidate_id = _required_string(transaction, 'candidate_id')
+    if candidate_id != state_dir.name or not re.fullmatch(
+        r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', candidate_id
+    ):
+        raise ManifestError(f'{context} candidate identity is invalid')
+    manifest_sha256 = _required_string(transaction, 'manifest_sha256')
+    if not re.fullmatch(r'[0-9a-f]{64}', manifest_sha256):
+        raise ManifestError(f'{context} manifest hash is invalid')
+
+    started_at = transaction.get('started_at')
+    if (
+        not isinstance(started_at, int)
+        or isinstance(started_at, bool)
+        or started_at < 0
+    ):
+        raise ManifestError(f'{context} started_at is invalid')
+
+    original_sha = _report_sha(transaction, 'original_sha')
+    candidate_sha = _report_sha(transaction, 'candidate_sha')
+    original_artifact_sha256 = _required_string(transaction, 'original_artifact_sha256')
+    candidate_artifact_sha256 = _required_string(transaction, 'candidate_artifact_sha256')
+    if (
+        not re.fullmatch(r'[0-9a-f]{64}', original_artifact_sha256)
+        or not re.fullmatch(r'[0-9a-f]{64}', candidate_artifact_sha256)
+        or original_artifact_sha256 == candidate_artifact_sha256
+    ):
+        raise ManifestError(f'{context} contains invalid bundle hashes')
+
+    target = _transaction_path(transaction.get('target'), 'target')
+    staged = _transaction_path(transaction.get('staged'), 'staged')
+    backup = _transaction_path(transaction.get('backup'), 'backup')
+    if (
+        staged != target.with_name(f'.{target.stem}.install-{candidate_id}.app')
+        or backup != target.with_name(f'.{target.stem}.rollback-{candidate_id}.app')
+    ):
+        raise ManifestError(f'{context} bundle paths are invalid')
+
+    return _InstallTransactionMetadata(
+        candidate_id=candidate_id,
+        manifest_sha256=manifest_sha256,
+        original_sha=original_sha,
+        candidate_sha=candidate_sha,
+        target=target,
+        staged=staged,
+        backup=backup,
+        original_artifact_sha256=original_artifact_sha256,
+        candidate_artifact_sha256=candidate_artifact_sha256,
+        started_at=started_at,
+    )
+
+
+def _validate_install_terminal_metadata(
+    state_dir: Path,
+    metadata: _InstallTransactionMetadata,
+    *,
+    allow_pending: bool,
+    historical: bool = False,
+) -> tuple[Path, str] | None:
+    install_report = state_dir / 'install.json'
+    recovery_report = state_dir / 'recovery.json'
+    terminal_reports = [
+        report for report in (install_report, recovery_report) if _path_lexists(report)
+    ]
+    if not terminal_reports and allow_pending:
+        return None
+    if len(terminal_reports) != 1:
+        prefix = 'historical ' if historical else ''
+        raise ManifestError(f'{prefix}install transaction is not uniquely terminal')
+
+    report_path = terminal_reports[0]
+    terminal = _read_json_object(report_path)
+    if report_path == install_report:
+        valid = (
+            terminal.get('schema') == 1
+            and terminal.get('candidate_id') == metadata.candidate_id
+            and terminal.get('status') == 'installed'
+            and terminal.get('original_sha') == metadata.original_sha
+            and terminal.get('candidate_sha') == metadata.candidate_sha
+            and terminal.get('artifact_sha256') == metadata.candidate_artifact_sha256
+            and terminal.get('safety_ref')
+            == f'refs/hermes-managed-update/safety/{metadata.candidate_id}'
+        )
+        kind = 'installed'
+    else:
+        recovered_at = terminal.get('recovered_at')
+        valid = (
+            terminal.get('schema') == 1
+            and terminal.get('candidate_id') == metadata.candidate_id
+            and terminal.get('status') == 'rolled-back'
+            and terminal.get('original_sha') == metadata.original_sha
+            and terminal.get('candidate_sha') == metadata.candidate_sha
+            and terminal.get('original_artifact_sha256')
+            == metadata.original_artifact_sha256
+            and terminal.get('candidate_artifact_sha256')
+            == metadata.candidate_artifact_sha256
+            and isinstance(recovered_at, int)
+            and not isinstance(recovered_at, bool)
+            and recovered_at >= 0
+        )
+        kind = 'rolled-back'
+    if not valid:
+        if historical:
+            raise ManifestError('invalid historical install transaction report')
+        if kind == 'installed':
+            raise ManifestError('invalid committed install report')
+        raise ManifestError('invalid install recovery report')
+    return report_path, kind
+
+
+def _next_install_started_at(state_root: Path) -> int:
+    state_root = Path(state_root).expanduser().resolve()
+    if not state_root.is_dir() or state_root.is_symlink():
+        raise ManifestError('managed update state root must be a real directory')
+
+    existing: set[int] = set()
+    for state_dir in sorted(state_root.iterdir(), key=lambda item: item.name):
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', state_dir.name):
+            continue
+        if not state_dir.is_dir() or state_dir.is_symlink():
+            continue
+        transaction_path = state_dir / 'transaction.json'
+        if not _path_lexists(transaction_path):
+            continue
+        transaction = _read_json_object(transaction_path)
+        started_at = transaction.get('started_at')
+        if (
+            not isinstance(started_at, int)
+            or isinstance(started_at, bool)
+            or started_at < 0
+        ):
+            raise ManifestError('existing install transaction started_at is invalid')
+        if started_at in existing:
+            raise ManifestError('existing install transactions have ambiguous started_at ordering')
+        existing.add(started_at)
+
+    minimum = max(existing, default=-1) + 1
+    return max(time.time_ns(), minimum)
+
+
 def _recover_install_transaction_locked(
     manifest: ManagedUpdateManifest,
     state_dir: Path,
 ) -> Path:
     state_dir = Path(state_dir).resolve()
     transaction = _read_json_object(state_dir / 'transaction.json')
-    if transaction.get('schema') != 1 or transaction.get('status') != 'installing':
-        raise ManifestError('invalid install transaction journal')
-    candidate_id = _required_string(transaction, 'candidate_id')
-    if candidate_id != state_dir.name or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', candidate_id):
-        raise ManifestError('install transaction candidate identity is invalid')
-    if _required_string(transaction, 'manifest_sha256') != manifest_digest(manifest):
+    metadata = _validate_install_transaction_metadata(state_dir, transaction)
+    if metadata.manifest_sha256 != manifest_digest(manifest):
         raise ManifestError('install transaction manifest does not match current configuration')
 
-    target = _transaction_path(transaction.get('target'), 'target')
-    staged = _transaction_path(transaction.get('staged'), 'staged')
-    backup = _transaction_path(transaction.get('backup'), 'backup')
     expected_target = manifest.installed_app.resolve()
-    expected_staged = expected_target.with_name(f'.{expected_target.stem}.install-{candidate_id}.app')
-    expected_backup = expected_target.with_name(f'.{expected_target.stem}.rollback-{candidate_id}.app')
-    if target != expected_target or staged != expected_staged or backup != expected_backup:
+    if metadata.target != expected_target:
         raise ManifestError('install transaction bundle paths do not match the manifest and candidate')
+    if _run_git(manifest.worktree, 'branch', '--show-current') != manifest.branch:
+        raise ManifestError('active branch does not match the managed update manifest')
 
-    original_sha = _report_sha(transaction, 'original_sha')
-    candidate_sha = _report_sha(transaction, 'candidate_sha')
-    original_artifact_sha256 = _required_string(transaction, 'original_artifact_sha256')
-    candidate_artifact_sha256 = _required_string(transaction, 'candidate_artifact_sha256')
-    if not re.fullmatch(r'[0-9a-f]{64}', original_artifact_sha256) or not re.fullmatch(
-        r'[0-9a-f]{64}', candidate_artifact_sha256
-    ):
-        raise ManifestError('install transaction contains an invalid bundle hash')
-    if original_artifact_sha256 == candidate_artifact_sha256:
-        raise ManifestError('install transaction cannot distinguish old and candidate bundles')
+    terminal = _validate_install_terminal_metadata(
+        state_dir,
+        metadata,
+        allow_pending=True,
+    )
+    head = _run_git(manifest.worktree, 'rev-parse', 'HEAD^{commit}')
+    if terminal is not None:
+        report_path, kind = terminal
+        if kind == 'installed':
+            if head != metadata.candidate_sha:
+                raise ManifestError('committed install report does not match active Git HEAD')
+            if (
+                not _path_lexists(metadata.target)
+                or _hash_artifact(metadata.target) != metadata.candidate_artifact_sha256
+            ):
+                raise ManifestError(
+                    'committed install report does not match the installed app bundle'
+                )
+            if (
+                not _path_lexists(metadata.backup)
+                or _hash_artifact(metadata.backup) != metadata.original_artifact_sha256
+            ):
+                raise ManifestError(
+                    'committed install report does not match the retained rollback bundle'
+                )
+            if _path_lexists(metadata.staged):
+                raise ManifestError('committed install left an unexpected staging bundle')
+            safety_ref = f'refs/hermes-managed-update/safety/{metadata.candidate_id}'
+            try:
+                safety_sha = _run_git(
+                    manifest.worktree,
+                    'rev-parse',
+                    f'{safety_ref}^{{commit}}',
+                )
+            except ManifestError as error:
+                raise ManifestError('committed install safety ref is missing or invalid') from error
+            if safety_sha != metadata.original_sha:
+                raise ManifestError('committed install safety ref does not match original Git HEAD')
+            return report_path
 
-    install_report = state_dir / 'install.json'
-    if _path_lexists(install_report):
-        installed = _read_json_object(install_report)
-        if (
-            installed.get('schema') != 1
-            or installed.get('candidate_id') != candidate_id
-            or installed.get('status') != 'installed'
-            or installed.get('original_sha') != original_sha
-            or installed.get('candidate_sha') != candidate_sha
-            or installed.get('artifact_sha256') != candidate_artifact_sha256
-        ):
-            raise ManifestError('invalid committed install report')
-        if _run_git(manifest.worktree, 'rev-parse', 'HEAD^{commit}') != candidate_sha:
-            raise ManifestError('committed install report does not match active Git HEAD')
-        if not _path_lexists(target) or _hash_artifact(target) != candidate_artifact_sha256:
-            raise ManifestError('committed install report does not match the installed app bundle')
-        if not _path_lexists(backup) or _hash_artifact(backup) != original_artifact_sha256:
-            raise ManifestError('committed install report does not match the retained rollback bundle')
-        if _path_lexists(staged):
-            raise ManifestError('committed install left an unexpected staging bundle')
-        return install_report
-
-    recovery_report = state_dir / 'recovery.json'
-    if _path_lexists(recovery_report):
-        recovered = _read_json_object(recovery_report)
-        if (
-            recovered.get('schema') != 1
-            or recovered.get('candidate_id') != candidate_id
-            or recovered.get('status') != 'rolled-back'
-            or recovered.get('original_sha') != original_sha
-            or recovered.get('candidate_sha') != candidate_sha
-            or recovered.get('original_artifact_sha256') != original_artifact_sha256
-            or recovered.get('candidate_artifact_sha256') != candidate_artifact_sha256
-        ):
-            raise ManifestError('invalid install recovery report')
-        if _run_git(manifest.worktree, 'rev-parse', 'HEAD^{commit}') != original_sha:
+        if head != metadata.original_sha:
             raise ManifestError('install recovery report does not match active Git HEAD')
-        if not _path_lexists(target) or _hash_artifact(target) != original_artifact_sha256:
+        if (
+            not _path_lexists(metadata.target)
+            or _hash_artifact(metadata.target) != metadata.original_artifact_sha256
+        ):
             raise ManifestError('install recovery report does not match the installed app bundle')
-        if _path_lexists(staged) or _path_lexists(backup):
+        if _path_lexists(metadata.staged) or _path_lexists(metadata.backup):
             raise ManifestError('install recovery report left an unexpected side bundle')
-        return recovery_report
+        return report_path
 
-    if not _path_lexists(target):
+    if not _path_lexists(metadata.target):
         raise ManifestError('cannot recover install transaction because the target app is missing')
+    if head not in (metadata.original_sha, metadata.candidate_sha):
+        raise ManifestError('active Git HEAD matches neither side of the install transaction')
+    if head == metadata.candidate_sha and _run_git(
+        manifest.worktree, 'status', '--porcelain'
+    ):
+        raise ManifestError('active worktree is dirty and cannot be rolled back safely')
 
     def bundle_hash(path: Path) -> str | None:
         return _hash_artifact(path) if _path_lexists(path) else None
 
-    target_hash = bundle_hash(target)
-    side_hashes = {path: bundle_hash(path) for path in (staged, backup)}
-    if target_hash == candidate_artifact_sha256:
-        old_sources = [path for path, digest in side_hashes.items() if digest == original_artifact_sha256]
+    target_hash = bundle_hash(metadata.target)
+    side_hashes = {
+        path: bundle_hash(path) for path in (metadata.staged, metadata.backup)
+    }
+    for path, digest in side_hashes.items():
+        if digest is not None and digest not in (
+            metadata.original_artifact_sha256,
+            metadata.candidate_artifact_sha256,
+        ):
+            raise ManifestError(f'cannot safely remove unrecognized recovery bundle: {path}')
+
+    original_source: Path | None = None
+    if target_hash == metadata.candidate_artifact_sha256:
+        old_sources = [
+            path
+            for path, digest in side_hashes.items()
+            if digest == metadata.original_artifact_sha256
+        ]
         if len(old_sources) != 1:
-            raise ManifestError('cannot identify exactly one original bundle for transaction recovery')
-        source = old_sources[0]
-        _rename_swap(target, source)
-        side_hashes[source] = candidate_artifact_sha256
-    elif target_hash != original_artifact_sha256:
+            raise ManifestError(
+                'cannot identify exactly one original bundle for transaction recovery'
+            )
+        original_source = old_sources[0]
+    elif target_hash != metadata.original_artifact_sha256:
         raise ManifestError('target app hash matches neither the original nor candidate bundle')
 
+    # Every fail-closed precondition above is complete before the first mutation.
+    if head == metadata.candidate_sha:
+        _run_git(manifest.worktree, 'reset', '--keep', metadata.original_sha)
+    if original_source is not None:
+        _rename_swap(metadata.target, original_source)
+        side_hashes[original_source] = metadata.candidate_artifact_sha256
     for path, digest in side_hashes.items():
-        if digest is None:
-            continue
-        if digest not in (original_artifact_sha256, candidate_artifact_sha256):
-            if target_hash == original_artifact_sha256 and path == staged:
-                _remove_path(path)
-                continue
-            raise ManifestError(f'cannot safely remove unrecognized recovery bundle: {path}')
-        _remove_path(path)
+        if digest is not None:
+            _remove_path(path)
 
-    if _hash_artifact(target) != original_artifact_sha256:
+    if _hash_artifact(metadata.target) != metadata.original_artifact_sha256:
         raise ManifestError('transaction recovery did not restore the original app bundle')
-
-    head = _run_git(manifest.worktree, 'rev-parse', 'HEAD^{commit}')
-    if head == candidate_sha:
-        _run_git(manifest.worktree, 'reset', '--keep', original_sha)
-    elif head != original_sha:
-        raise ManifestError('active Git HEAD matches neither side of the install transaction')
-    if _run_git(manifest.worktree, 'rev-parse', 'HEAD^{commit}') != original_sha:
+    if _run_git(manifest.worktree, 'rev-parse', 'HEAD^{commit}') != metadata.original_sha:
         raise ManifestError('transaction recovery did not restore the original Git HEAD')
 
+    recovery_report = state_dir / 'recovery.json'
     _write_immutable_json(
         recovery_report,
         {
             'schema': 1,
             'status': 'rolled-back',
-            'candidate_id': candidate_id,
-            'original_sha': original_sha,
-            'candidate_sha': candidate_sha,
-            'original_artifact_sha256': original_artifact_sha256,
-            'candidate_artifact_sha256': candidate_artifact_sha256,
+            'candidate_id': metadata.candidate_id,
+            'original_sha': metadata.original_sha,
+            'candidate_sha': metadata.candidate_sha,
+            'original_artifact_sha256': metadata.original_artifact_sha256,
+            'candidate_artifact_sha256': metadata.candidate_artifact_sha256,
             'recovered_at': int(time.time()),
         },
     )
     return recovery_report
 
 
+def _recover_pending_install_transactions_locked(
+    manifest: ManagedUpdateManifest,
+    state_root: Path,
+    *,
+    required_latest_state_dir: Path | None = None,
+) -> tuple[Path, ...]:
+    state_root = Path(state_root).expanduser().resolve()
+    required_latest = (
+        Path(required_latest_state_dir).expanduser().resolve()
+        if required_latest_state_dir is not None
+        else None
+    )
+    if not _path_lexists(state_root):
+        if required_latest is not None:
+            raise ManifestError('requested install transaction is not the latest install transaction')
+        return ()
+    if not state_root.is_dir() or state_root.is_symlink():
+        raise ManifestError('managed update state root must be a real directory')
+
+    transactions: list[tuple[int, Path, _InstallTransactionMetadata]] = []
+    for state_dir in sorted(state_root.iterdir(), key=lambda item: item.name):
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', state_dir.name):
+            continue
+        if not state_dir.is_dir() or state_dir.is_symlink():
+            continue
+        transaction_path = state_dir / 'transaction.json'
+        if not _path_lexists(transaction_path):
+            continue
+        transaction = _read_json_object(transaction_path)
+        metadata = _validate_install_transaction_metadata(state_dir, transaction)
+        transactions.append((metadata.started_at, state_dir.resolve(), metadata))
+
+    if not transactions:
+        if required_latest is not None:
+            raise ManifestError('requested install transaction is not the latest install transaction')
+        return ()
+    started_values = [started_at for started_at, _state_dir, _metadata in transactions]
+    if len(set(started_values)) != len(started_values):
+        raise ManifestError('multiple install transactions have ambiguous started_at ordering')
+    transactions.sort(key=lambda item: item[0])
+
+    for _started_at, historical_state_dir, metadata in transactions[:-1]:
+        _validate_install_terminal_metadata(
+            historical_state_dir,
+            metadata,
+            allow_pending=False,
+            historical=True,
+        )
+
+    current_state_dir = transactions[-1][1]
+    if required_latest is not None and current_state_dir != required_latest:
+        raise ManifestError('requested install transaction is not the latest install transaction')
+    current_metadata = transactions[-1][2]
+    terminal = _validate_install_terminal_metadata(
+        current_state_dir,
+        current_metadata,
+        allow_pending=True,
+    )
+    if terminal is not None and required_latest is None:
+        return ()
+    report = _recover_install_transaction_locked(manifest, current_state_dir)
+    if terminal is not None:
+        return ()
+    return (report,)
+
+
 def recover_install_transaction(
     manifest: ManagedUpdateManifest,
     state_dir: Path,
 ) -> Path:
+    state_dir = Path(state_dir).expanduser().resolve()
     with _repository_update_lock(manifest):
-        return _recover_install_transaction_locked(manifest, state_dir)
+        reports = _recover_pending_install_transactions_locked(
+            manifest,
+            state_dir.parent,
+            required_latest_state_dir=state_dir,
+        )
+        if reports:
+            return reports[0]
+        install_report = state_dir / 'install.json'
+        recovery_report = state_dir / 'recovery.json'
+        if _path_lexists(install_report) == _path_lexists(recovery_report):
+            raise ManifestError('install transaction is not uniquely terminal')
+        return install_report if _path_lexists(install_report) else recovery_report
 
 
 def recover_pending_install_transactions(
     manifest: ManagedUpdateManifest,
     state_root: Path,
 ) -> tuple[Path, ...]:
-    state_root = Path(state_root).expanduser().resolve()
-    if not _path_lexists(state_root):
-        return ()
-    if not state_root.is_dir() or state_root.is_symlink():
-        raise ManifestError('managed update state root must be a real directory')
-
-    recovered: list[Path] = []
-    for state_dir in sorted(state_root.iterdir(), key=lambda item: item.name):
-        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', state_dir.name):
-            continue
-        if not state_dir.is_dir() or state_dir.is_symlink():
-            continue
-        transaction = state_dir / 'transaction.json'
-        if not _path_lexists(transaction):
-            continue
-        already_terminal = _path_lexists(state_dir / 'install.json') or _path_lexists(
-            state_dir / 'recovery.json'
-        )
-        report = recover_install_transaction(manifest, state_dir)
-        if not already_terminal:
-            recovered.append(report)
-    return tuple(recovered)
+    with _repository_update_lock(manifest):
+        return _recover_pending_install_transactions_locked(manifest, state_root)
 
 
 def validate_install_approval(
@@ -1661,6 +1886,7 @@ def _install_verified_candidate_locked(
         confirmed_artifact_sha256=confirmed_artifact_sha256,
     )
     current_manifest_sha256 = manifest_digest(manifest)
+    _recover_pending_install_transactions_locked(manifest, candidate.state_dir.parent)
     _verify_candidate_source(manifest, candidate, 'installation')
     if _hash_artifact(verified.artifact) != verified.artifact_sha256:
         raise ManifestError('verified artifact changed after verification')
@@ -1689,10 +1915,7 @@ def _install_verified_candidate_locked(
     ):
         raise ManifestError('pre-existing install or recovery report blocks this update')
     if _path_lexists(transaction_path):
-        recovered = _recover_install_transaction_locked(manifest, candidate.state_dir)
-        if recovered.name == 'install.json':
-            raise ManifestError('candidate installation is already committed')
-        raise ManifestError('a previous candidate installation was recovered and cannot be replayed')
+        raise ManifestError('pre-existing install transaction blocks this update')
     if _path_lexists(backup) or _path_lexists(staged):
         raise ManifestError('stale install or rollback bundle blocks this update')
 
@@ -1713,7 +1936,7 @@ def _install_verified_candidate_locked(
             'backup': str(backup),
             'original_artifact_sha256': original_artifact_sha256,
             'candidate_artifact_sha256': verified.artifact_sha256,
-            'started_at': int(time.time()),
+            'started_at': _next_install_started_at(candidate.state_dir.parent),
         },
     )
 
