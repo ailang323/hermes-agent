@@ -1482,6 +1482,7 @@ export interface Translations {
     missingTitle: string
     missingBody: string
   }
+  kanban: Record<string, unknown>
 
   sidebar: {
     nav: Record<string, string>
