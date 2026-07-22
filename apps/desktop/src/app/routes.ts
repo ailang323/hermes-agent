@@ -64,7 +64,19 @@ export const APP_ROUTES = [
 ] as const satisfies readonly AppRoute[]
 
 const APP_VIEW_BY_PATH = new Map<string, AppView>(APP_ROUTES.map(route => [route.path, route.view]))
-const RESERVED_PATHS: ReadonlySet<string> = new Set(APP_ROUTES.map(route => route.path))
+
+// Plugin-owned page paths the core must never parse as a session id, even
+// before the plugin's ROUTES_AREA contribution has registered (first paint,
+// plugin still loading, or plugin failed to load). Unlike APP_ROUTES entries
+// these map to no built-in view: appViewForPath falls to 'chat' only while
+// the contribution is absent, which is the safe pre-plugin fallback.
+export const KANBAN_ROUTE = '/kanban'
+const PLUGIN_OWNED_PATHS: ReadonlySet<string> = new Set([KANBAN_ROUTE])
+
+const RESERVED_PATHS: ReadonlySet<string> = new Set([
+  ...APP_ROUTES.map(route => route.path),
+  ...PLUGIN_OWNED_PATHS
+])
 
 // ── Contributed routes — the `routes` registry area ─────────────────────────
 // A contribution mounts a FULL PAGE in the workspace pane at `data.path`
@@ -89,7 +101,11 @@ export function contributedRoutes(): Array<{ key: string; path: string; title?: 
       title: c.title,
       render: c.render!
     }))
-    .filter(route => Boolean(route.path.startsWith('/') && route.render) && !RESERVED_PATHS.has(route.path))
+    // Built-in APP_ROUTES paths are owned by core views — a contribution
+    // targeting one would shadow it, so those stay filtered. PLUGIN_OWNED_PATHS
+    // (e.g. /kanban) are reserved only against session-id parsing; the plugin's
+    // contribution is exactly what renders them, so they must pass through.
+    .filter(route => Boolean(route.path.startsWith('/') && route.render) && (PLUGIN_OWNED_PATHS.has(route.path) || !RESERVED_PATHS.has(route.path)))
 }
 
 function isContributedPath(pathname: string): boolean {

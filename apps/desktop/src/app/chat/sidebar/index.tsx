@@ -1105,7 +1105,7 @@ export function ChatSidebar({
                   (item.id === 'skills' && currentView === 'skills') ||
                   (item.id === 'messaging' && currentView === 'messaging') ||
                   (item.id === 'artifacts' && currentView === 'artifacts') ||
-                  // Contributed rows light up at their own route.
+                  // Contributed rows light up at their own route (kanban included).
                   (Boolean(item.route) && pathname === item.route)
 
                 const isNewSession = item.id === 'new-session'
