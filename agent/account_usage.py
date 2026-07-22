@@ -40,6 +40,7 @@ class AccountUsageSnapshot:
     windows: tuple[AccountUsageWindow, ...] = ()
     details: tuple[str, ...] = ()
     unavailable_reason: Optional[str] = None
+    account_email: Optional[str] = None
 
     @property
     def available(self) -> bool:
@@ -510,6 +511,11 @@ def _fetch_codex_account_usage(
         response = client.get(_resolve_codex_usage_url(resolved_base_url), headers=headers)
         response.raise_for_status()
     payload = response.json() or {}
+    account_payload = payload.get("account")
+    account = account_payload if isinstance(account_payload, dict) else {}
+    account_email = str(
+        payload.get("account_email") or payload.get("email") or account.get("email") or ""
+    ).strip() or None
     rate_limit = payload.get("rate_limit") or {}
     windows: list[AccountUsageWindow] = []
     for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
@@ -536,6 +542,7 @@ def _fetch_codex_account_usage(
         provider="openai-codex",
         source="usage_api",
         fetched_at=_utc_now(),
+        account_email=account_email,
         plan=_title_case_slug(payload.get("plan_type")),
         windows=tuple(windows),
         details=tuple(details),

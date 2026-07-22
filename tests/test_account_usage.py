@@ -66,6 +66,7 @@ def test_fetch_account_usage_codex(monkeypatch):
         "agent.account_usage.httpx.Client",
         lambda timeout=15.0: _Client(
             {
+                "email": "codex@example.test",
                 "plan_type": "pro",
                 "rate_limit": {
                     "primary_window": {
@@ -87,6 +88,7 @@ def test_fetch_account_usage_codex(monkeypatch):
     snapshot = fetch_account_usage("openai-codex")
 
     assert snapshot is not None
+    assert snapshot.account_email == "codex@example.test"
     assert snapshot.plan == "Pro"
     assert len(snapshot.windows) == 2
     assert snapshot.windows[0].label == "Session"

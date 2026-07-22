@@ -1,4 +1,5 @@
 import { useStore } from '@nanostores/react'
+import { useQuery } from '@tanstack/react-query'
 import { useCallback, useMemo } from 'react'
 
 import type { CommandCenterSection } from '@/app/command-center'
@@ -8,15 +9,18 @@ import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
 import { Codicon } from '@/components/ui/codicon'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { useI18n } from '@/i18n'
+import { CODEX_PROVIDER, codexUsageQueryOptions, normalizeCodexUsageProvider } from '@/lib/codex-usage-query'
 import { Activity, AlertCircle, Clock, Command, Hash, Loader2, Terminal, Zap, ZapFilled } from '@/lib/icons'
 import type { RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { contextBarLabel, LiveDuration, usageContextLabel } from '@/lib/statusbar'
 import { cn } from '@/lib/utils'
 import { setGlobalYolo, setSessionYolo } from '@/lib/yolo-session'
+import { $activeGatewayProfile } from '@/store/profile'
 import {
   $activeSessionId,
   $busy,
   $connection,
+  $currentProvider,
   $currentUsage,
   $sessionStartedAt,
   $turnStartedAt,
@@ -86,6 +90,32 @@ export function useStatusbarItems({
   const backendUpdateApply = useStore($backendUpdateApply)
   const desktopVersion = useStore($desktopVersion)
   const connection = useStore($connection)
+  const activeGatewayProfile = useStore($activeGatewayProfile)
+  const currentProvider = useStore($currentProvider)
+  const normalizedProvider = normalizeCodexUsageProvider(currentProvider)
+
+  const codexQuota = useQuery(
+    codexUsageQueryOptions({
+      profile: activeGatewayProfile,
+      provider: currentProvider
+    })
+  )
+
+  const codexQuotaWindow = codexQuota.data?.windows.find(
+    window => typeof window.remaining_percent === 'number' || typeof window.used_percent === 'number'
+  )
+
+  const rawRemaining =
+    typeof codexQuotaWindow?.remaining_percent === 'number'
+      ? codexQuotaWindow.remaining_percent
+      : typeof codexQuotaWindow?.used_percent === 'number'
+        ? 100 - codexQuotaWindow.used_percent
+        : null
+
+  const codexQuotaRemaining =
+    rawRemaining !== null && Number.isFinite(rawRemaining) ? Math.max(0, Math.min(100, Math.round(rawRemaining))) : null
+
+  const codexQuotaAvailable = codexQuota.data?.available === true && codexQuotaRemaining !== null
 
   const contextUsage = useMemo(() => usageContextLabel(currentUsage), [currentUsage])
   const contextBar = useMemo(() => contextBarLabel(currentUsage), [currentUsage])
@@ -362,6 +392,25 @@ export function useStatusbarItems({
         variant: 'text'
       },
       {
+        className: codexQuotaAvailable
+          ? 'text-emerald-600 hover:text-emerald-600 dark:text-emerald-400 dark:hover:text-emerald-400'
+          : codexQuota.isError
+            ? 'text-destructive hover:text-destructive'
+            : undefined,
+        hidden: normalizedProvider !== CODEX_PROVIDER,
+        id: 'codex-quota',
+        label: codexQuota.isPending
+          ? 'Quota…'
+          : codexQuotaAvailable
+            ? `${codexQuotaRemaining}% left`
+            : 'Quota unavailable',
+        title: codexQuotaAvailable
+          ? `OpenAI Codex quota${codexQuota.data?.plan ? ` · ${codexQuota.data.plan}` : ''}${codexQuotaWindow?.label ? ` · ${codexQuotaWindow.label}` : ''}`
+          : (codexQuota.data?.error ??
+            (codexQuota.error instanceof Error ? codexQuota.error.message : 'OpenAI Codex quota is unavailable')),
+        variant: 'text'
+      },
+      {
         detail: contextBar || undefined,
         hidden: !contextUsage,
         id: 'context-usage',
@@ -413,10 +462,19 @@ export function useStatusbarItems({
       busy,
       chatOpen,
       clientVersionItem,
+      codexQuota.data?.error,
+      codexQuota.data?.plan,
+      codexQuota.error,
+      codexQuota.isError,
+      codexQuota.isPending,
+      codexQuotaAvailable,
+      codexQuotaRemaining,
+      codexQuotaWindow?.label,
       contextBar,
       contextUsage,
       copy,
       currentUsage,
+      normalizedProvider,
       requestGateway,
       sessionStartedAt,
       showYoloToggle,

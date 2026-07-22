@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  getCodexUsage,
   getCronJobs,
   getGlobalModelInfo,
   getGlobalModelOptions,
@@ -109,6 +110,15 @@ describe('Hermes REST session helpers', () => {
       await call()
       expect(api).toHaveBeenCalledWith(expect.objectContaining({ path, timeoutMs: 60_000 }))
     }
+  })
+
+  it('routes Codex quota through the explicitly requested profile backend', async () => {
+    await getCodexUsage('luxuryai-dev')
+
+    expect(api).toHaveBeenCalledWith({
+      path: '/api/codex/usage',
+      profile: 'luxuryai-dev'
+    })
   })
 
   it('keeps the liveness poll on the short default so a dead backend fails fast', async () => {

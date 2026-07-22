@@ -8,6 +8,7 @@ import type {
   AudioTranscriptionResponse,
   AuxiliaryModelsResponse,
   BackendUpdateCheckResponse,
+  CodexUsageResponse,
   ComputerUseStatus,
   ConfigSchemaResponse,
   CronJob,
@@ -327,6 +328,15 @@ export function getGlobalModelInfo(): Promise<ModelInfoResponse> {
     ...profileScoped(),
     path: '/api/model/info',
     timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
+  })
+}
+
+export function getCodexUsage(profile: string): Promise<CodexUsageResponse> {
+  const normalizedProfile = profile.trim()
+
+  return window.hermesDesktop.api<CodexUsageResponse>({
+    ...(normalizedProfile ? { profile: normalizedProfile } : {}),
+    path: '/api/codex/usage'
   })
 }
 

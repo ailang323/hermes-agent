@@ -46,13 +46,13 @@ export function useModelControls({ activeSessionId, queryClient, requestGateway 
         return
       }
 
-      if (!force && $currentModel.get()) {
+      if (!force && $currentModel.get() && $currentProvider.get()) {
         return
       }
 
       const result = await getGlobalModelInfo()
 
-      if ($activeSessionId.get() || (!force && $currentModel.get())) {
+      if ($activeSessionId.get() || (!force && $currentModel.get() && $currentProvider.get())) {
         return
       }
 

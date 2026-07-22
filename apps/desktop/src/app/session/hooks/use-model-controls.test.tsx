@@ -53,6 +53,7 @@ function Harness({
 
 describe('useModelControls', () => {
   beforeEach(() => {
+    vi.clearAllMocks()
     $activeSessionId.set(null)
     setCurrentModel('')
     setCurrentProvider('')
@@ -82,6 +83,29 @@ describe('useModelControls', () => {
 
     await result.current.refreshCurrentModel()
 
+    expect($currentModel.get()).toBe('openai/gpt-5.5')
+    expect($currentProvider.get()).toBe('openai-codex')
+  })
+
+  it('resolves the provider for a stored default model', async () => {
+    setCurrentModel('openai/gpt-5.5')
+    setCurrentProvider('')
+    vi.mocked(getGlobalModelInfo).mockResolvedValue({
+      model: 'openai/gpt-5.5',
+      provider: 'openai-codex'
+    })
+
+    const { result } = renderHook(() =>
+      useModelControls({
+        activeSessionId: null,
+        queryClient: new QueryClient(),
+        requestGateway: vi.fn()
+      })
+    )
+
+    await result.current.refreshCurrentModel()
+
+    expect(getGlobalModelInfo).toHaveBeenCalledOnce()
     expect($currentModel.get()).toBe('openai/gpt-5.5')
     expect($currentProvider.get()).toBe('openai-codex')
   })

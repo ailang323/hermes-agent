@@ -224,6 +224,27 @@ export interface HermesConfig {
 
 export type HermesConfigRecord = Record<string, unknown>
 
+export interface CodexUsageWindow {
+  detail?: null | string
+  label: string
+  remaining_percent?: null | number
+  reset_at?: null | string
+  used_percent?: null | number
+}
+
+export interface CodexUsageResponse {
+  account_email?: null | string
+  available: boolean
+  details?: string[]
+  error?: null | string
+  fetched_at?: string
+  plan?: null | string
+  provider: string
+  source?: string
+  title?: string
+  windows: CodexUsageWindow[]
+}
+
 export interface ModelInfoResponse {
   auto_context_length?: number
   capabilities?: Record<string, unknown>

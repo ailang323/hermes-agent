@@ -5291,6 +5291,51 @@ def get_model_info(profile: Optional[str] = None):
         return dict(_EMPTY_MODEL_INFO)
 
 
+@app.get("/api/codex/usage")
+def get_codex_usage(profile: Optional[str] = None):
+    """Return profile-scoped OpenAI Codex account quota without exposing credentials."""
+    from agent.account_usage import fetch_account_usage
+
+    with _profile_scope(profile):
+        snapshot = fetch_account_usage("openai-codex")
+
+    if snapshot is None:
+        return {
+            "available": False,
+            "provider": "openai-codex",
+            "account_email": None,
+            "windows": [],
+            "details": [],
+            "error": "Codex account usage is unavailable for this profile",
+        }
+
+    windows = []
+    for window in snapshot.windows:
+        used = float(window.used_percent) if window.used_percent is not None else None
+        windows.append(
+            {
+                "label": window.label,
+                "used_percent": used,
+                "remaining_percent": max(0.0, min(100.0, 100.0 - used)) if used is not None else None,
+                "reset_at": window.reset_at.isoformat() if window.reset_at is not None else None,
+                "detail": window.detail,
+            }
+        )
+
+    return {
+        "available": bool(snapshot.available),
+        "provider": snapshot.provider,
+        "source": snapshot.source,
+        "fetched_at": snapshot.fetched_at.isoformat(),
+        "account_email": snapshot.account_email,
+        "title": snapshot.title,
+        "plan": snapshot.plan,
+        "windows": windows,
+        "details": list(snapshot.details),
+        "error": snapshot.unavailable_reason,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Model assignment — pick provider+model for main slot or auxiliary slots.
 # Mirrors the model.options JSON-RPC from tui_gateway but uses REST so the
