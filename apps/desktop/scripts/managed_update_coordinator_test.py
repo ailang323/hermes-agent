@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from dataclasses import replace
@@ -331,6 +332,361 @@ class CandidatePreparationTests(unittest.TestCase):
             self.assertEqual(report['status'], 'conflict')
             self.assertEqual(report['conflicts'], ['shared.txt'])
 
+    def test_prepare_candidate_reuses_matching_nonterminal_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp:
+            root = Path(raw_temp)
+            worktree = root / 'active'
+            app = root / 'Hermes.app'
+            state_root = root / 'state'
+            worktree.mkdir()
+            app.mkdir()
+            git(worktree, 'init', '-b', 'feat/longer-stable-v2')
+            git(worktree, 'config', 'user.name', 'Managed Update Test')
+            git(worktree, 'config', 'user.email', 'managed-update@example.invalid')
+            shared = worktree / 'shared.txt'
+            shared.write_text('base\n', encoding='utf-8')
+            git(worktree, 'add', 'shared.txt')
+            git(worktree, 'commit', '-m', 'base')
+            base_sha = git(worktree, 'rev-parse', 'HEAD')
+            shared.write_text('custom\n', encoding='utf-8')
+            git(worktree, 'commit', '-am', 'feat: custom shared behavior')
+
+            git(worktree, 'switch', '--detach', base_sha)
+            shared.write_text('upstream\n', encoding='utf-8')
+            git(worktree, 'commit', '-am', 'feat: upstream shared behavior')
+            git(
+                worktree,
+                'update-ref',
+                'refs/remotes/upstream/main',
+                git(worktree, 'rev-parse', 'HEAD'),
+            )
+            git(worktree, 'switch', 'feat/longer-stable-v2')
+
+            manifest_path = root / 'manifest.json'
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        'schema': 1,
+                        'mode': 'managed-patch-stack',
+                        'worktree': str(worktree),
+                        'branch': 'feat/longer-stable-v2',
+                        'upstream': 'upstream/main',
+                        'installed_app': str(app),
+                        'features': [
+                            {
+                                'id': 'custom-shared',
+                                'commit_subject': 'feat: custom shared behavior',
+                            }
+                        ],
+                    }
+                ),
+                encoding='utf-8',
+            )
+            manifest = load_manifest(manifest_path)
+            with patch.object(
+                coordinator,
+                '_repository_update_lock',
+                wraps=coordinator._repository_update_lock,
+            ) as update_lock:
+                first = prepare_candidate(manifest, state_root, candidate_id='candidate-first')
+            update_lock.assert_called_once_with(manifest)
+            self.assertEqual(first.status, 'conflict')
+
+            retry = prepare_candidate(manifest, state_root, candidate_id='candidate-retry')
+
+            self.assertEqual(retry, first)
+            self.assertFalse((state_root / 'candidate-retry').exists())
+            self.assertEqual(
+                sorted(path.name for path in state_root.iterdir()),
+                ['candidate-first'],
+            )
+
+            report_path = first.state_dir / 'report.json'
+            canonical_report = json.loads(report_path.read_text(encoding='utf-8'))
+            state_alias = root / 'state-alias'
+            state_alias.symlink_to(state_root, target_is_directory=True)
+            aliased_report = dict(canonical_report)
+            aliased_report['state_dir'] = str(state_alias / first.candidate_id)
+            report_path.chmod(0o600)
+            report_path.write_text(json.dumps(aliased_report), encoding='utf-8')
+            with self.assertRaisesRegex(ManifestError, 'canonical candidate state directory'):
+                load_candidate(first.state_dir)
+
+            worktree_alias = first.state_dir / 'worktree-alias'
+            worktree_alias.symlink_to(first.worktree, target_is_directory=True)
+            aliased_report['state_dir'] = str(first.state_dir)
+            aliased_report['worktree'] = str(worktree_alias)
+            report_path.write_text(json.dumps(aliased_report), encoding='utf-8')
+            with self.assertRaisesRegex(ManifestError, 'canonical candidate worktree'):
+                load_candidate(first.state_dir)
+            report_path.write_text(json.dumps(canonical_report), encoding='utf-8')
+            report_path.chmod(0o444)
+            worktree_alias.unlink()
+            state_alias.unlink()
+
+            verification_path = first.state_dir / 'verification.json'
+            verification_path.write_text('{}', encoding='utf-8')
+            with self.assertRaisesRegex(
+                ManifestError,
+                "candidate 'candidate-first' already has verification state; install or cancel it",
+            ):
+                prepare_candidate(manifest, state_root, candidate_id='candidate-after-verification')
+            self.assertFalse((state_root / 'candidate-after-verification').exists())
+            verification_path.unlink()
+
+            duplicate_state = state_root.resolve() / 'candidate-second'
+            duplicate_worktree = duplicate_state / 'worktree'
+            duplicate_state.mkdir()
+            git(
+                worktree,
+                'worktree',
+                'add',
+                '--detach',
+                str(duplicate_worktree),
+                first.candidate_sha,
+            )
+            duplicate_report = json.loads(
+                (first.state_dir / 'report.json').read_text(encoding='utf-8')
+            )
+            duplicate_report.update(
+                {
+                    'candidate_id': 'candidate-second',
+                    'state_dir': str(duplicate_state),
+                    'worktree': str(duplicate_worktree),
+                }
+            )
+            (duplicate_state / 'report.json').write_text(
+                json.dumps(duplicate_report),
+                encoding='utf-8',
+            )
+
+            with self.assertRaisesRegex(
+                ManifestError,
+                'multiple matching active candidates.*candidate-first, candidate-second',
+            ):
+                prepare_candidate(manifest, state_root, candidate_id='candidate-third')
+            self.assertFalse((state_root / 'candidate-third').exists())
+
+            for candidate_id in ('candidate-first', 'candidate-second'):
+                (state_root / candidate_id / 'cancellation.json').write_text(
+                    json.dumps(
+                        {
+                            'schema': 1,
+                            'status': 'cancelled',
+                            'candidate_id': candidate_id,
+                        }
+                    ),
+                    encoding='utf-8',
+                )
+
+            (state_root / 'candidate-first' / 'cancellation.json').write_text(
+                '{}',
+                encoding='utf-8',
+            )
+            with self.assertRaisesRegex(
+                ManifestError,
+                "candidate 'candidate-first' has an invalid cancellation.json marker",
+            ):
+                prepare_candidate(manifest, state_root, candidate_id='candidate-invalid-marker')
+            self.assertFalse((state_root / 'candidate-invalid-marker').exists())
+            (state_root / 'candidate-first' / 'cancellation.json').write_text(
+                json.dumps(
+                    {
+                        'schema': 1,
+                        'status': 'cancelled',
+                        'candidate_id': 'candidate-first',
+                    }
+                ),
+                encoding='utf-8',
+            )
+
+            first_cancellation = state_root / 'candidate-first' / 'cancellation.json'
+            first_intent = state_root / 'candidate-first' / 'cancellation-intent.json'
+            first_cancellation.unlink()
+            first_intent.write_text(
+                json.dumps(
+                    {
+                        'schema': 1,
+                        'status': 'cancelling',
+                        'candidate_id': 'candidate-first',
+                    }
+                ),
+                encoding='utf-8',
+            )
+            with self.assertRaisesRegex(
+                ManifestError,
+                "candidate 'candidate-first' cancellation is incomplete",
+            ):
+                prepare_candidate(manifest, state_root, candidate_id='candidate-intent-only')
+            self.assertFalse((state_root / 'candidate-intent-only').exists())
+            first_cancellation.write_text(
+                json.dumps(
+                    {
+                        'schema': 1,
+                        'status': 'cancelled',
+                        'candidate_id': 'candidate-first',
+                    }
+                ),
+                encoding='utf-8',
+            )
+
+            first_transaction = state_root / 'candidate-first' / 'transaction.json'
+            first_transaction.write_text('{}', encoding='utf-8')
+            with self.assertRaisesRegex(
+                ManifestError,
+                "candidate 'candidate-first' has a pending install transaction; recover it first",
+            ):
+                prepare_candidate(manifest, state_root, candidate_id='candidate-cancelled-transaction')
+            self.assertFalse((state_root / 'candidate-cancelled-transaction').exists())
+            first_transaction.unlink()
+
+            cancelled_without_report = state_root / 'candidate-cancelled-without-report'
+            cancelled_without_report.mkdir()
+            (cancelled_without_report / 'cancellation.json').write_text(
+                json.dumps(
+                    {
+                        'schema': 1,
+                        'status': 'cancelled',
+                        'candidate_id': 'candidate-cancelled-without-report',
+                    }
+                ),
+                encoding='utf-8',
+            )
+            with self.assertRaisesRegex(
+                ManifestError,
+                "cannot inspect cancelled candidate 'candidate-cancelled-without-report'",
+            ):
+                prepare_candidate(manifest, state_root, candidate_id='candidate-after-bad-cancel')
+            self.assertFalse((state_root / 'candidate-after-bad-cancel').exists())
+            shutil.rmtree(cancelled_without_report)
+
+            broken_state = state_root / 'candidate-broken'
+            (broken_state / 'worktree').mkdir(parents=True)
+            (broken_state / 'report.json').write_text('{}', encoding='utf-8')
+
+            with self.assertRaisesRegex(
+                ManifestError,
+                "cannot inspect candidate 'candidate-broken'",
+            ):
+                prepare_candidate(manifest, state_root, candidate_id='candidate-fourth')
+            self.assertFalse((state_root / 'candidate-fourth').exists())
+
+            shutil.rmtree(broken_state)
+            broken_terminal_state = state_root / 'candidate-broken-terminal'
+            broken_terminal_state.mkdir()
+            (broken_terminal_state / 'install.json').write_text('{}', encoding='utf-8')
+            with self.assertRaisesRegex(
+                ManifestError,
+                "candidate 'candidate-broken-terminal' has invalid terminal install state",
+            ):
+                prepare_candidate(manifest, state_root, candidate_id='candidate-fifth')
+            self.assertFalse((state_root / 'candidate-fifth').exists())
+
+            shutil.rmtree(broken_terminal_state)
+            symlink_state = state_root / 'candidate-symlink-report'
+            symlink_state.mkdir()
+            (symlink_state / 'report.json').symlink_to(first.state_dir / 'report.json')
+            with self.assertRaisesRegex(
+                ManifestError,
+                'report.json must be a regular file',
+            ):
+                load_candidate(symlink_state)
+            with self.assertRaisesRegex(
+                ManifestError,
+                "candidate 'candidate-symlink-report' report must be a regular file",
+            ):
+                prepare_candidate(manifest, state_root, candidate_id='candidate-sixth')
+            self.assertFalse((state_root / 'candidate-sixth').exists())
+
+            symlink_state.unlink() if symlink_state.is_symlink() else shutil.rmtree(symlink_state)
+            incomplete_state = state_root / 'candidate-incomplete'
+            (incomplete_state / 'worktree').mkdir(parents=True)
+            with self.assertRaisesRegex(
+                ManifestError,
+                "candidate 'candidate-incomplete' has incomplete state without report.json",
+            ):
+                prepare_candidate(manifest, state_root, candidate_id='candidate-seventh')
+            self.assertFalse((state_root / 'candidate-seventh').exists())
+
+            shutil.rmtree(incomplete_state)
+            symlink_target = root / 'outside-candidate-state'
+            symlink_target.mkdir()
+            candidate_state_symlink = state_root / 'candidate-state-symlink'
+            candidate_state_symlink.symlink_to(symlink_target, target_is_directory=True)
+            with self.assertRaisesRegex(
+                ManifestError,
+                'candidate state directory must be a real directory',
+            ):
+                coordinator._candidate_state_dir(state_root, 'candidate-state-symlink')
+            symlink_cli_output = io.StringIO()
+            with redirect_stdout(symlink_cli_output):
+                symlink_cli_exit = main(
+                    [
+                        '--manifest',
+                        str(manifest_path),
+                        'cancel',
+                        '--state-root',
+                        str(state_root),
+                        '--candidate-id',
+                        'candidate-state-symlink',
+                    ]
+                )
+            self.assertEqual(symlink_cli_exit, 1)
+            self.assertIn(
+                'candidate state directory must be a real directory',
+                json.loads(symlink_cli_output.getvalue())['message'],
+            )
+            self.assertFalse((symlink_target / 'cancellation-intent.json').exists())
+            with self.assertRaisesRegex(
+                ManifestError,
+                "candidate state 'candidate-state-symlink' must be a real directory",
+            ):
+                prepare_candidate(manifest, state_root, candidate_id='candidate-eighth')
+            self.assertFalse((state_root / 'candidate-eighth').exists())
+            candidate_state_symlink.unlink()
+
+            candidate_state_file = state_root / 'candidate-state-file'
+            candidate_state_file.write_text('not a state directory', encoding='utf-8')
+            with self.assertRaisesRegex(
+                ManifestError,
+                "candidate state 'candidate-state-file' must be a real directory",
+            ):
+                prepare_candidate(manifest, state_root, candidate_id='candidate-ninth')
+            self.assertFalse((state_root / 'candidate-ninth').exists())
+            candidate_state_file.unlink()
+
+            worktree_symlink_state = state_root.resolve() / 'candidate-worktree-symlink'
+            worktree_symlink_state.mkdir()
+            (worktree_symlink_state / 'worktree').symlink_to(
+                first.worktree,
+                target_is_directory=True,
+            )
+            worktree_symlink_report = json.loads(
+                (first.state_dir / 'report.json').read_text(encoding='utf-8')
+            )
+            worktree_symlink_report.update(
+                {
+                    'candidate_id': 'candidate-worktree-symlink',
+                    'state_dir': str(worktree_symlink_state),
+                    'worktree': str(worktree_symlink_state / 'worktree'),
+                }
+            )
+            (worktree_symlink_state / 'report.json').write_text(
+                json.dumps(worktree_symlink_report),
+                encoding='utf-8',
+            )
+            with self.assertRaisesRegex(
+                ManifestError,
+                'candidate worktree must be a real directory',
+            ):
+                load_candidate(worktree_symlink_state)
+            with self.assertRaisesRegex(
+                ManifestError,
+                "candidate 'candidate-worktree-symlink' worktree must be a real directory",
+            ):
+                prepare_candidate(manifest, state_root, candidate_id='candidate-tenth')
+            self.assertFalse((state_root / 'candidate-tenth').exists())
+
     def test_upstream_equivalence_rejects_whitespace_only_control_flow_changes(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temp:
             worktree = Path(raw_temp) / 'repository'
@@ -409,7 +765,7 @@ class CandidatePreparationTests(unittest.TestCase):
                         'branch': 'feat/longer-stable-v2',
                         'upstream': 'upstream/main',
                         'installed_app': str(app),
-                        'artifact': 'artifact.bin',
+                        'artifact': 'artifact/Hermes.app',
                         'verification_commands': [],
                         'features': [
                             {
@@ -429,7 +785,9 @@ class CandidatePreparationTests(unittest.TestCase):
             resolved_shared.write_text('upstream\ncustom\n', encoding='utf-8')
             git(candidate.worktree, 'add', 'shared.txt')
             git(candidate.worktree, '-c', 'core.editor=true', 'rebase', '--continue')
-            (candidate.worktree / 'artifact.bin').write_bytes(b'resolved artifact')
+            artifact = candidate.worktree / 'artifact' / 'Hermes.app'
+            artifact.mkdir(parents=True)
+            (artifact / 'marker.txt').write_text('resolved artifact\n', encoding='utf-8')
 
             # Simulate a process interruption after the durable conflict resolution was
             # written but before verification.json and candidate-ready were emitted.
@@ -472,6 +830,25 @@ class CandidatePreparationTests(unittest.TestCase):
             self.assertEqual(load_candidate(candidate.state_dir), ready)
             self.assertEqual(git(worktree, 'rev-parse', 'HEAD'), original_sha)
             self.assertEqual(git(worktree, 'status', '--porcelain=v1'), '')
+            verified = load_verified_candidate(candidate.state_dir, ready)
+
+            def copy_bundle(source: Path, target: Path) -> None:
+                shutil.copytree(source, target, symlinks=True)
+
+            installed = install_verified_candidate(
+                manifest,
+                ready,
+                verified,
+                confirmation_token=event['confirmation_token'],
+                confirmed_candidate_sha=ready.candidate_sha,
+                confirmed_artifact_sha256=verified.artifact_sha256,
+                copy_bundle=copy_bundle,
+                health_check=lambda target: (target / 'marker.txt').read_text(
+                    encoding='utf-8'
+                )
+                == 'resolved artifact\n',
+            )
+            self.assertEqual(installed.status, 'installed')
 
     def test_prepare_candidate_requires_review_when_upstream_absorbs_a_feature(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temp:
@@ -516,7 +893,7 @@ class CandidatePreparationTests(unittest.TestCase):
                         'features': [
                             {'id': 'local-feature', 'commit_subject': 'feat: local feature'}
                         ],
-                        'artifact': 'artifact.bin',
+                        'artifact': 'artifact/Hermes.app',
                     }
                 ),
                 encoding='utf-8',
@@ -537,12 +914,76 @@ class CandidatePreparationTests(unittest.TestCase):
             report = json.loads((result.state_dir / 'report.json').read_text(encoding='utf-8'))
             self.assertEqual(report['recommendations'][0]['feature_id'], 'local-feature')
 
-            (result.worktree / 'artifact.bin').write_bytes(b'accepted-review')
-            verified = accept_candidate_review(manifest, result)
+            decision_path = result.state_dir / 'decision.json'
+            decision_path.write_text(
+                json.dumps(
+                    {
+                        'schema': 1,
+                        'candidate_id': result.candidate_id,
+                        'decision': 'accept-upstream-equivalents',
+                        'features': ['local-feature'],
+                        'accepted_at': 1,
+                    }
+                ),
+                encoding='utf-8',
+            )
+            resumed = prepare_candidate(
+                manifest,
+                root / 'state',
+                candidate_id='candidate-review-retry',
+            )
+            self.assertEqual(resumed.status, 'ready')
+            self.assertEqual(resumed.candidate_id, result.candidate_id)
+            self.assertFalse((root / 'state' / 'candidate-review-retry').exists())
+
+            artifact = resumed.worktree / 'artifact' / 'Hermes.app'
+            artifact.mkdir(parents=True)
+            (artifact / 'marker.txt').write_text('accepted-review\n', encoding='utf-8')
+            verified = verify_candidate(manifest, resumed)
             self.assertEqual(verified.status, 'verified')
-            decision = json.loads((result.state_dir / 'decision.json').read_text(encoding='utf-8'))
+            decision = json.loads(decision_path.read_text(encoding='utf-8'))
             self.assertEqual(decision['decision'], 'accept-upstream-equivalents')
             self.assertEqual(decision['features'], ['local-feature'])
+
+            def copy_bundle(source: Path, target: Path) -> None:
+                shutil.copytree(source, target, symlinks=True)
+
+            # A genuinely stale in-memory candidate (never derived from the persisted
+            # decision) must fail closed before any transaction or other mutation.
+            stale_candidate = load_candidate(resumed.state_dir)
+            self.assertEqual(stale_candidate.status, 'review')
+            before_head = git(worktree, 'rev-parse', 'HEAD')
+            with self.assertRaisesRegex(
+                ManifestError,
+                'candidate state changed after verification',
+            ):
+                install_verified_candidate(
+                    manifest,
+                    stale_candidate,
+                    verified,
+                    confirmation_token=approval_token(manifest, resumed, verified),
+                    confirmed_candidate_sha=resumed.candidate_sha,
+                    confirmed_artifact_sha256=verified.artifact_sha256,
+                    copy_bundle=copy_bundle,
+                    health_check=lambda target: True,
+                )
+            self.assertFalse((resumed.state_dir / 'transaction.json').exists())
+            self.assertEqual(git(worktree, 'rev-parse', 'HEAD'), before_head)
+
+            installed = install_verified_candidate(
+                manifest,
+                resumed,
+                verified,
+                confirmation_token=approval_token(manifest, resumed, verified),
+                confirmed_candidate_sha=resumed.candidate_sha,
+                confirmed_artifact_sha256=verified.artifact_sha256,
+                copy_bundle=copy_bundle,
+                health_check=lambda target: (target / 'marker.txt').read_text(
+                    encoding='utf-8'
+                )
+                == 'accepted-review\n',
+            )
+            self.assertEqual(installed.status, 'installed')
 
     def test_patch_identity_preserves_duplicate_subject_multiplicity(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temp:
@@ -618,7 +1059,7 @@ class CandidatePreparationTests(unittest.TestCase):
 class CandidateCancellationTests(unittest.TestCase):
     def test_cancel_removes_linked_worktree_preserves_audit_and_invalidates_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temp:
-            root = Path(raw_temp)
+            root = Path(raw_temp).resolve()
             active = root / 'active'
             state_dir = root / 'state' / 'candidate-cancel'
             worktree = state_dir / 'worktree'
@@ -665,6 +1106,13 @@ class CandidateCancellationTests(unittest.TestCase):
             )
             _write_candidate_report(candidate)
 
+            transaction_path = state_dir / 'transaction.json'
+            transaction_path.write_text('{}', encoding='utf-8')
+            with self.assertRaisesRegex(ManifestError, 'pending install transaction'):
+                cancel_candidate(manifest, candidate)
+            self.assertFalse((state_dir / 'cancellation-intent.json').exists())
+            transaction_path.unlink()
+
             cancellation = cancel_candidate(manifest, candidate)
             first_report = cancellation.read_bytes()
 
@@ -672,6 +1120,16 @@ class CandidateCancellationTests(unittest.TestCase):
             self.assertTrue((state_dir / 'report.json').is_file())
             self.assertEqual(json.loads(first_report)['status'], 'cancelled')
             self.assertEqual(json.loads(first_report)['candidate_id'], 'candidate-cancel')
+            final_real = state_dir / 'cancellation-real.json'
+            cancellation.replace(final_real)
+            cancellation.symlink_to(final_real)
+            with self.assertRaisesRegex(
+                ManifestError,
+                'cancellation.json must be a regular file',
+            ):
+                cancel_candidate(manifest, candidate)
+            cancellation.unlink()
+            final_real.replace(cancellation)
             self.assertEqual(cancel_candidate(manifest, candidate).read_bytes(), first_report)
             stdout = io.StringIO()
             with redirect_stdout(stdout):
@@ -700,6 +1158,7 @@ class CandidateCancellationTests(unittest.TestCase):
             state_dir = state_root / 'malformed-candidate'
             active.mkdir()
             installed_app.mkdir()
+            git(active, 'init', '-b', 'feat/longer-stable-v2')
             state_dir.mkdir(parents=True)
             (state_dir / 'report.json').write_text('{ malformed', encoding='utf-8')
             manifest_path = root / 'manifest.json'
@@ -770,7 +1229,7 @@ class ArtifactHashTests(unittest.TestCase):
 class CandidateVerificationTests(unittest.TestCase):
     def test_verify_candidate_hashes_the_exact_artifact_created_by_argv_commands(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temp:
-            root = Path(raw_temp)
+            root = Path(raw_temp).resolve()
             state_dir = root / 'candidate-verify'
             worktree = state_dir / 'worktree'
             active = root / 'active'
@@ -881,6 +1340,17 @@ class CandidateVerificationTests(unittest.TestCase):
             self.assertEqual(restored_verified, verified)
 
             verification_path = state_dir / 'verification.json'
+            verification_real = state_dir / 'verification-real.json'
+            verification_path.replace(verification_real)
+            verification_path.symlink_to(verification_real)
+            with self.assertRaisesRegex(
+                ManifestError,
+                'verification.json must be a regular file',
+            ):
+                load_verified_candidate(state_dir, candidate)
+            verification_path.unlink()
+            verification_real.replace(verification_path)
+
             verification_report = json.loads(verification_path.read_text(encoding='utf-8'))
             verification_report['commands'][0]['returncode'] = 1
             verification_path.chmod(0o600)
@@ -956,7 +1426,7 @@ class CandidateInstallationTests(unittest.TestCase):
 
     def test_install_verified_candidate_promotes_exact_commit_and_atomically_swaps_app(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temp:
-            root = Path(raw_temp)
+            root = Path(raw_temp).resolve()
             active = root / 'active'
             state_dir = root / 'state' / 'candidate-install'
             candidate_worktree = state_dir / 'worktree'
@@ -1021,6 +1491,7 @@ class CandidateInstallationTests(unittest.TestCase):
                 original_commits=_commit_identities(active, base_sha, original_sha),
                 candidate_commits=_commit_identities(candidate_worktree, base_sha, candidate_sha),
             )
+            _write_candidate_report(candidate)
             verified = verify_candidate(manifest, candidate)
 
             def copy_test_bundle(source: Path, target: Path) -> None:
@@ -1138,13 +1609,154 @@ class CandidateInstallationTests(unittest.TestCase):
             self.assertEqual(git(active, 'rev-parse', 'HEAD'), before_head)
             self.assertEqual(_hash_artifact(installed_app), before_app_hash)
             self.assertFalse((state_dir / 'transaction.json').exists())
+
+            stale_intent = state_dir / 'cancellation-intent.json'
+            stale_intent.write_text(
+                json.dumps(
+                    {
+                        'schema': 1,
+                        'status': 'cancelling',
+                        'candidate_id': candidate.candidate_id,
+                    }
+                ),
+                encoding='utf-8',
+            )
+            with self.assertRaisesRegex(ManifestError, 'cancel'):
+                install_current_candidate()
+            self.assertFalse((state_dir / 'transaction.json').exists())
+            stale_intent.unlink()
+
+            install_reloaded = threading.Event()
+            resume_install = threading.Event()
+            invalidation_started = threading.Event()
+            install_results: list[InstallResult] = []
+            install_errors: list[BaseException] = []
+            invalidation_errors: list[BaseException] = []
+            original_load_effective = coordinator._load_effective_candidate
+
+            def pausing_load_effective(
+                loaded_state_dir: Path,
+                *,
+                allow_cancelled: bool = False,
+            ) -> CandidateResult:
+                result = original_load_effective(
+                    loaded_state_dir,
+                    allow_cancelled=allow_cancelled,
+                )
+                if threading.current_thread().name == 'managed-update-install-test':
+                    install_reloaded.set()
+                    if not resume_install.wait(timeout=5):
+                        raise AssertionError('installer interleaving test timed out')
+                return result
+
+            def run_install() -> None:
+                try:
+                    install_results.append(install_current_candidate())
+                except BaseException as error:
+                    install_errors.append(error)
+
+            def run_invalidation() -> None:
+                invalidation_started.set()
+                try:
+                    coordinator.invalidate_candidate_state(
+                        manifest,
+                        state_dir,
+                        candidate.candidate_id,
+                    )
+                except BaseException as error:
+                    invalidation_errors.append(error)
+
             with (
                 patch.object(coordinator.time, 'time', return_value=123),
                 patch.object(coordinator.time, 'time_ns', return_value=123),
+                patch.object(
+                    coordinator,
+                    '_load_effective_candidate',
+                    side_effect=pausing_load_effective,
+                ),
             ):
-                installed = install_current_candidate()
+                installer = threading.Thread(
+                    target=run_install,
+                    name='managed-update-install-test',
+                )
+                invalidator = threading.Thread(target=run_invalidation)
+                installer.start()
+                self.assertTrue(install_reloaded.wait(timeout=5))
+                invalidator.start()
+                self.assertTrue(invalidation_started.wait(timeout=5))
+                try:
+                    invalidator.join(timeout=0.2)
+                    self.assertTrue(invalidator.is_alive())
+                    self.assertFalse((state_dir / 'cancellation-intent.json').exists())
+                finally:
+                    resume_install.set()
+                    installer.join(timeout=10)
+                    invalidator.join(timeout=10)
+
+            self.assertFalse(installer.is_alive())
+            self.assertFalse(invalidator.is_alive())
+            self.assertEqual(install_errors, [])
+            self.assertEqual(len(install_results), 1)
+            installed = install_results[0]
+            self.assertEqual(len(invalidation_errors), 1)
+            self.assertIsInstance(invalidation_errors[0], ManifestError)
+            self.assertIn('cannot be cancelled', str(invalidation_errors[0]))
+            self.assertFalse((state_dir / 'cancellation-intent.json').exists())
 
             self.assertEqual(installed.status, 'installed')
+            with self.assertRaisesRegex(
+                ManifestError,
+                'installed or recovered candidate cannot be cancelled',
+            ):
+                cancel_candidate(manifest, candidate)
+            self.assertFalse((state_dir / 'cancellation-intent.json').exists())
+            historical_cancellation = state_dir / 'cancellation.json'
+            historical_cancellation.write_text(
+                json.dumps(
+                    {
+                        'schema': 1,
+                        'status': 'cancelled',
+                        'candidate_id': candidate.candidate_id,
+                    }
+                ),
+                encoding='utf-8',
+            )
+            self.assertIsNone(
+                coordinator._find_reusable_candidate(
+                    state_dir.parent,
+                    coordinator.inspect_repository(manifest),
+                )
+            )
+            historical_cancellation.unlink()
+            historical_intent = state_dir / 'cancellation-intent.json'
+            historical_intent.write_text(
+                json.dumps(
+                    {
+                        'schema': 1,
+                        'status': 'cancelling',
+                        'candidate_id': candidate.candidate_id,
+                    }
+                ),
+                encoding='utf-8',
+            )
+            self.assertIsNone(
+                coordinator._find_reusable_candidate(
+                    state_dir.parent,
+                    coordinator.inspect_repository(manifest),
+                )
+            )
+            historical_intent.unlink()
+            install_path = state_dir / 'install.json'
+            install_real = state_dir / 'install-real.json'
+            install_path.replace(install_real)
+            install_path.symlink_to(install_real)
+            with self.assertRaisesRegex(
+                ManifestError,
+                'install.json must be a regular file',
+            ):
+                recover_install_transaction(manifest, state_dir)
+            install_path.unlink()
+            install_real.replace(install_path)
             transaction = json.loads(
                 (state_dir / 'transaction.json').read_text(encoding='utf-8')
             )
@@ -1160,6 +1772,17 @@ class CandidateInstallationTests(unittest.TestCase):
             transaction_path = state_dir / 'transaction.json'
             transaction = json.loads(transaction_path.read_text(encoding='utf-8'))
             self.assertEqual(transaction['status'], 'installing')
+
+            transaction_real = state_dir / 'transaction-real.json'
+            transaction_path.replace(transaction_real)
+            transaction_path.symlink_to(transaction_real)
+            with self.assertRaisesRegex(
+                ManifestError,
+                'transaction.json must be a regular file',
+            ):
+                recover_install_transaction(manifest, state_dir)
+            transaction_path.unlink()
+            transaction_real.replace(transaction_path)
 
             transaction_without_started_at = dict(transaction)
             transaction_without_started_at.pop('started_at')
@@ -1876,6 +2499,108 @@ class CoordinatorCliTests(unittest.TestCase):
             self.assertEqual(event['artifact_sha256'], hashlib.sha256(b'cli').hexdigest())
             self.assertEqual(git(active, 'rev-parse', 'HEAD'), original_sha)
 
+    def test_concurrent_prepare_serializes_verification_and_preserves_artifact_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp:
+            root = Path(raw_temp)
+            active = root / 'active'
+            installed_app = root / 'Hermes.app'
+            state_root = root / 'state'
+            active.mkdir()
+            installed_app.mkdir()
+            git(active, 'init', '-b', 'feat/longer-stable-v2')
+            git(active, 'config', 'user.name', 'Managed Update Test')
+            git(active, 'config', 'user.email', 'managed-update@example.invalid')
+            (active / 'base.txt').write_text('base\n', encoding='utf-8')
+            git(active, 'add', 'base.txt')
+            git(active, 'commit', '-m', 'base')
+            base_sha = git(active, 'rev-parse', 'HEAD')
+            git(active, 'update-ref', 'refs/remotes/upstream/main', base_sha)
+            (active / 'custom.txt').write_text('custom\n', encoding='utf-8')
+            git(active, 'add', 'custom.txt')
+            git(active, 'commit', '-m', 'feat: custom behavior')
+
+            verifier = (
+                "from pathlib import Path; import os, time; "
+                "lock=Path('verification-leader.lock'); follower=Path('verification-follower.started'); "
+                "leader=False\n"
+                "try:\n"
+                " fd=os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY); os.close(fd); leader=True\n"
+                "except FileExistsError:\n"
+                " follower.write_text(str(os.getpid())); leader=False\n"
+                "if leader:\n"
+                " deadline=time.monotonic()+2\n"
+                " while not follower.exists() and time.monotonic()<deadline: time.sleep(0.01)\n"
+                " Path('artifact.bin').write_bytes(b'leader')\n"
+                " time.sleep(0.1)\n"
+                "else:\n"
+                " time.sleep(0.5)\n"
+                " Path('artifact.bin').write_bytes(b'loser')\n"
+            )
+            manifest_path = root / 'manifest.json'
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        'schema': 1,
+                        'mode': 'managed-patch-stack',
+                        'worktree': str(active),
+                        'branch': 'feat/longer-stable-v2',
+                        'upstream': 'upstream/main',
+                        'installed_app': str(installed_app),
+                        'features': [],
+                        'verification_commands': [
+                            {
+                                'name': 'concurrent-build',
+                                'argv': [sys.executable, '-c', verifier],
+                                'cwd': '.',
+                            }
+                        ],
+                        'artifact': 'artifact.bin',
+                    }
+                ),
+                encoding='utf-8',
+            )
+            command = [
+                sys.executable,
+                str(Path(coordinator.__file__).resolve()),
+                '--manifest',
+                str(manifest_path),
+                'prepare',
+                '--state-root',
+                str(state_root),
+                '--no-fetch',
+            ]
+            processes = [
+                subprocess.Popen(
+                    [*command, '--candidate-id', candidate_id],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                for candidate_id in ('concurrent-a', 'concurrent-b')
+            ]
+            results = [process.communicate(timeout=15) for process in processes]
+            returncodes = [process.returncode for process in processes]
+
+            self.assertEqual(sorted(returncodes), [0, 1])
+            success_index = returncodes.index(0)
+            failure_index = returncodes.index(1)
+            event = json.loads(results[success_index][0])
+            failure = json.loads(results[failure_index][0])
+            self.assertEqual(event['event'], 'candidate-ready')
+            self.assertEqual(failure['event'], 'error')
+            self.assertIn('already has verification state', failure['message'])
+            candidate_state = state_root / event['candidate_id']
+            verification = json.loads(
+                (candidate_state / 'verification.json').read_text(encoding='utf-8')
+            )
+            artifact = candidate_state / 'worktree' / 'artifact.bin'
+            self.assertEqual(
+                verification['artifact_sha256'],
+                hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(artifact.read_bytes(), b'leader')
+            self.assertEqual(len([path for path in state_root.iterdir() if path.is_dir()]), 1)
+
     def test_accept_review_loads_candidate_and_emits_verified_event(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temp:
             root = Path(raw_temp)
@@ -1883,6 +2608,7 @@ class CoordinatorCliTests(unittest.TestCase):
             installed_app = root / 'Hermes.app'
             active.mkdir()
             installed_app.mkdir()
+            git(active, 'init', '-b', 'feat/longer-stable-v2')
             manifest_path = root / 'manifest.json'
             manifest_path.write_text(
                 json.dumps(
@@ -1899,6 +2625,7 @@ class CoordinatorCliTests(unittest.TestCase):
                 encoding='utf-8',
             )
             state_dir = root / 'state' / 'cli-review'
+            state_dir.mkdir(parents=True)
             candidate = CandidateResult(
                 candidate_id='cli-review',
                 state_dir=state_dir,
@@ -1976,6 +2703,7 @@ class CoordinatorCliTests(unittest.TestCase):
                 encoding='utf-8',
             )
             state_dir = root / 'state' / 'cli-install'
+            state_dir.mkdir(parents=True)
             candidate = CandidateResult(
                 candidate_id='cli-install',
                 state_dir=state_dir,

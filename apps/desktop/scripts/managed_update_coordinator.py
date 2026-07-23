@@ -501,7 +501,227 @@ def _transformed_commit_payloads(
     return transformed
 
 
+def _candidate_is_cancelled(
+    state_dir: Path,
+    *,
+    allow_incomplete: bool = False,
+) -> bool:
+    intent_exists = False
+    final_exists = False
+    for marker_name, expected_status in (
+        ('cancellation-intent.json', 'cancelling'),
+        ('cancellation.json', 'cancelled'),
+    ):
+        marker_path = state_dir / marker_name
+        if not _path_lexists(marker_path):
+            continue
+        if marker_path.is_symlink() or not marker_path.is_file():
+            raise ManifestError(
+                f'candidate {state_dir.name!r} has an invalid {marker_name} marker'
+            )
+        marker = _read_json_object(marker_path)
+        if (
+            marker.get('schema') != 1
+            or marker.get('status') != expected_status
+            or marker.get('candidate_id') != state_dir.name
+        ):
+            raise ManifestError(
+                f'candidate {state_dir.name!r} has an invalid {marker_name} marker'
+            )
+        if marker_name == 'cancellation-intent.json':
+            intent_exists = True
+        else:
+            final_exists = True
+    if intent_exists and not final_exists and not allow_incomplete:
+        raise ManifestError(f'candidate {state_dir.name!r} cancellation is incomplete')
+    return final_exists
+
+
+def _candidate_has_terminal_install_state(state_dir: Path) -> bool:
+    terminal_paths = (state_dir / 'install.json', state_dir / 'recovery.json')
+    terminal_exists = False
+    for path in terminal_paths:
+        if not _path_lexists(path):
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise ManifestError(
+                f'candidate {state_dir.name!r} has invalid terminal install state: '
+                f'{path.name} must be a regular file'
+            )
+        terminal_exists = True
+    transaction_path = state_dir / 'transaction.json'
+    transaction_exists = _path_lexists(transaction_path)
+    if transaction_exists and (
+        transaction_path.is_symlink() or not transaction_path.is_file()
+    ):
+        raise ManifestError(
+            f'candidate {state_dir.name!r} has invalid terminal install state: '
+            'transaction.json must be a regular file'
+        )
+    if not terminal_exists:
+        if transaction_exists:
+            raise ManifestError(
+                f'candidate {state_dir.name!r} has a pending install transaction; recover it first'
+            )
+        return False
+
+    try:
+        if not transaction_exists:
+            raise ManifestError('terminal install report has no transaction journal')
+        metadata = _validate_install_transaction_metadata(
+            state_dir,
+            _read_json_object(transaction_path),
+            context='historical install transaction',
+        )
+        _validate_install_terminal_metadata(
+            state_dir,
+            metadata,
+            allow_pending=False,
+            historical=True,
+        )
+    except ManifestError as error:
+        raise ManifestError(
+            f'candidate {state_dir.name!r} has invalid terminal install state: {error}'
+        ) from error
+    return True
+
+
+def _candidate_after_persisted_review_decision(candidate: CandidateResult) -> CandidateResult:
+    decision_path = candidate.state_dir / 'decision.json'
+    if not _path_lexists(decision_path):
+        return candidate
+    if decision_path.is_symlink() or not decision_path.is_file():
+        raise ManifestError(
+            f'candidate {candidate.candidate_id!r} has invalid review decision state'
+        )
+    if candidate.status != 'review':
+        raise ManifestError(
+            f'candidate {candidate.candidate_id!r} has a review decision in status '
+            f'{candidate.status!r}'
+        )
+    try:
+        _review_decision_digest(candidate)
+    except ManifestError as error:
+        raise ManifestError(
+            f'candidate {candidate.candidate_id!r} has invalid review decision state: {error}'
+        ) from error
+    return replace(candidate, status='ready')
+
+
+def _find_reusable_candidate(
+    state_root: Path,
+    repository: RepositoryStatus,
+) -> CandidateResult | None:
+    raw_state_root = state_root.expanduser()
+    if not _path_lexists(raw_state_root):
+        return None
+    if raw_state_root.is_symlink() or not raw_state_root.is_dir():
+        raise ManifestError('managed update state root must be a real directory')
+
+    resolved_state_root = raw_state_root.resolve()
+    matches: list[CandidateResult] = []
+    for state_dir in sorted(resolved_state_root.iterdir(), key=lambda item: item.name):
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', state_dir.name):
+            continue
+        if state_dir.is_symlink() or not state_dir.is_dir():
+            raise ManifestError(
+                f'candidate state {state_dir.name!r} must be a real directory'
+            )
+        candidate_worktree = state_dir / 'worktree'
+        if candidate_worktree.is_symlink() or (
+            _path_lexists(candidate_worktree) and not candidate_worktree.is_dir()
+        ):
+            raise ManifestError(
+                f'candidate {state_dir.name!r} worktree must be a real directory'
+            )
+        terminal_install = _candidate_has_terminal_install_state(state_dir)
+        cancelled = _candidate_is_cancelled(
+            state_dir,
+            allow_incomplete=terminal_install,
+        )
+        if terminal_install:
+            continue
+        if cancelled:
+            try:
+                _load_effective_candidate(state_dir, allow_cancelled=True)
+            except ManifestError as error:
+                raise ManifestError(
+                    f'cannot inspect cancelled candidate {state_dir.name!r}: {error}'
+                ) from error
+            continue
+        verification_path = state_dir / 'verification.json'
+        if _path_lexists(verification_path):
+            if verification_path.is_symlink() or not verification_path.is_file():
+                raise ManifestError(
+                    f'candidate {state_dir.name!r} has invalid verification state'
+                )
+            raise ManifestError(
+                f'candidate {state_dir.name!r} already has verification state; install or cancel it'
+            )
+        report_path = state_dir / 'report.json'
+        if not _path_lexists(report_path):
+            raise ManifestError(
+                f'candidate {state_dir.name!r} has incomplete state without report.json'
+            )
+        if report_path.is_symlink() or not report_path.is_file():
+            raise ManifestError(
+                f'candidate {state_dir.name!r} report must be a regular file'
+            )
+        try:
+            candidate = _load_effective_candidate(state_dir)
+        except ManifestError as error:
+            raise ManifestError(
+                f'cannot inspect candidate {state_dir.name!r}: {error}'
+            ) from error
+        if (
+            candidate.original_sha == repository.original_sha
+            and candidate.upstream_sha == repository.upstream_sha
+        ):
+            matches.append(candidate)
+
+    if len(matches) > 1:
+        candidate_ids = ', '.join(candidate.candidate_id for candidate in matches)
+        raise ManifestError(
+            'multiple matching active candidates exist; cancel duplicates before preparing: '
+            f'{candidate_ids}'
+        )
+    return matches[0] if matches else None
+
+
 def prepare_candidate(
+    manifest: ManagedUpdateManifest,
+    state_root: Path,
+    *,
+    candidate_id: str,
+) -> CandidateResult:
+    with _repository_update_lock(manifest):
+        return _prepare_candidate_locked(
+            manifest,
+            state_root,
+            candidate_id=candidate_id,
+        )
+
+
+def _prepare_update(
+    manifest: ManagedUpdateManifest,
+    state_root: Path,
+    *,
+    candidate_id: str,
+    fetch: bool,
+) -> tuple[CandidateResult, VerifiedCandidate | None]:
+    with _repository_update_lock(manifest):
+        if fetch:
+            _fetch_configured_upstream(manifest)
+        candidate = _prepare_candidate_locked(
+            manifest,
+            state_root,
+            candidate_id=candidate_id,
+        )
+        verified = verify_candidate(manifest, candidate) if candidate.status == 'ready' else None
+        return candidate, verified
+
+
+def _prepare_candidate_locked(
     manifest: ManagedUpdateManifest,
     state_root: Path,
     *,
@@ -517,6 +737,10 @@ def prepare_candidate(
         )
     if not repository.clean:
         raise ManifestError('active worktree must be clean before preparing an update')
+
+    reusable = _find_reusable_candidate(state_root, repository)
+    if reusable is not None:
+        return reusable
 
     state_dir = state_root.expanduser().resolve() / candidate_id
     candidate_worktree = state_dir / 'worktree'
@@ -882,6 +1106,9 @@ def accept_candidate_review(
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
+    path = Path(path)
+    if path.is_symlink() or not path.is_file():
+        raise ManifestError(f'{path.name} must be a regular file: {path}')
     try:
         value = json.loads(path.read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError) as error:
@@ -924,8 +1151,22 @@ def _report_commit_identities(value: Any, field: str) -> tuple[CommitIdentity, .
     return tuple(identities)
 
 
+def _candidate_state_dir(state_root: Path, candidate_id: str) -> Path:
+    root_path = Path(state_root).expanduser()
+    if root_path.is_symlink() or not root_path.is_dir():
+        raise ManifestError('managed update state root must be a real directory')
+    state_dir = root_path.resolve() / candidate_id
+    if state_dir.is_symlink() or not state_dir.is_dir():
+        raise ManifestError('candidate state directory must be a real directory')
+    return state_dir
+
+
 def load_candidate(state_dir: Path, *, allow_cancelled: bool = False) -> CandidateResult:
-    state_dir = Path(state_dir)
+    state_dir = Path(state_dir).expanduser()
+    if state_dir.is_symlink() or not state_dir.is_dir():
+        raise ManifestError('candidate state directory must be a real directory')
+    canonical_state_dir = state_dir.resolve()
+    state_dir = canonical_state_dir
     if not allow_cancelled:
         for marker_name in ('cancellation-intent.json', 'cancellation.json'):
             marker_path = state_dir / marker_name
@@ -947,12 +1188,17 @@ def load_candidate(state_dir: Path, *, allow_cancelled: bool = False) -> Candida
         raise ManifestError('candidate report contains an invalid candidate_id')
     if state_dir.resolve().name != candidate_id:
         raise ManifestError('candidate report candidate_id does not match its directory')
-    reported_state_dir = Path(_required_string(report, 'state_dir'))
-    if reported_state_dir.resolve() != state_dir.resolve():
-        raise ManifestError('candidate report state_dir does not match its location')
-    worktree = Path(_required_string(report, 'worktree'))
-    if worktree.resolve() != (state_dir / 'worktree').resolve():
-        raise ManifestError('candidate worktree does not match its state directory')
+    reported_state_dir = Path(_required_string(report, 'state_dir')).expanduser()
+    if reported_state_dir != canonical_state_dir:
+        raise ManifestError('candidate report must name the canonical candidate state directory')
+    worktree = Path(_required_string(report, 'worktree')).expanduser()
+    expected_worktree = state_dir / 'worktree'
+    if expected_worktree.is_symlink() or (
+        _path_lexists(expected_worktree) and not expected_worktree.is_dir()
+    ):
+        raise ManifestError('candidate worktree must be a real directory')
+    if worktree != expected_worktree:
+        raise ManifestError('candidate report must name the canonical candidate worktree')
     status = _required_string(report, 'status')
     if status not in {'conflict', 'review', 'ready'}:
         raise ManifestError('candidate report contains an invalid status')
@@ -1012,9 +1258,9 @@ def load_candidate(state_dir: Path, *, allow_cancelled: bool = False) -> Candida
             raise ManifestError('candidate conflict resolution schema or status is invalid')
         if _required_string(resolution, 'candidate_id') != candidate_id:
             raise ManifestError('candidate conflict resolution candidate_id does not match')
-        if Path(_required_string(resolution, 'state_dir')).resolve() != state_dir.resolve():
+        if Path(_required_string(resolution, 'state_dir')).expanduser() != state_dir:
             raise ManifestError('candidate conflict resolution state_dir does not match')
-        if Path(_required_string(resolution, 'worktree')).resolve() != worktree.resolve():
+        if Path(_required_string(resolution, 'worktree')).expanduser() != expected_worktree:
             raise ManifestError('candidate conflict resolution worktree does not match')
         if _report_sha(resolution, 'original_sha') != original_sha:
             raise ManifestError('candidate conflict resolution original SHA does not match')
@@ -1056,8 +1302,8 @@ def load_candidate(state_dir: Path, *, allow_cancelled: bool = False) -> Candida
 
     return CandidateResult(
         candidate_id=candidate_id,
-        state_dir=reported_state_dir,
-        worktree=worktree,
+        state_dir=canonical_state_dir,
+        worktree=expected_worktree,
         status=status,
         original_sha=original_sha,
         upstream_sha=upstream_sha,
@@ -1068,6 +1314,16 @@ def load_candidate(state_dir: Path, *, allow_cancelled: bool = False) -> Candida
         recommendations=tuple(recommendations),
         original_commits=original_commits,
         candidate_commits=candidate_commits,
+    )
+
+
+def _load_effective_candidate(
+    state_dir: Path,
+    *,
+    allow_cancelled: bool = False,
+) -> CandidateResult:
+    return _candidate_after_persisted_review_decision(
+        load_candidate(state_dir, allow_cancelled=allow_cancelled)
     )
 
 
@@ -1144,12 +1400,22 @@ def resume_candidate_conflict(
     return load_candidate(candidate.state_dir)
 
 
-def invalidate_candidate_state(state_dir: Path, candidate_id: str) -> Path:
+def invalidate_candidate_state(
+    manifest: ManagedUpdateManifest,
+    state_dir: Path,
+    candidate_id: str,
+) -> Path:
+    with _repository_update_lock(manifest):
+        return _invalidate_candidate_state_locked(state_dir, candidate_id)
+
+
+def _invalidate_candidate_state_locked(state_dir: Path, candidate_id: str) -> Path:
     state_dir = Path(state_dir)
     if state_dir.is_symlink() or not state_dir.is_dir():
         raise ManifestError('candidate state directory must be a real directory')
     if state_dir.resolve().name != candidate_id:
         raise ManifestError('candidate state directory does not match candidate_id')
+    _ensure_candidate_cancellable(state_dir)
 
     intent_path = state_dir / 'cancellation-intent.json'
     if _path_lexists(intent_path):
@@ -1174,10 +1440,24 @@ def invalidate_candidate_state(state_dir: Path, candidate_id: str) -> Path:
     return intent_path
 
 
+def _ensure_candidate_cancellable(state_dir: Path) -> None:
+    if _candidate_has_terminal_install_state(state_dir):
+        raise ManifestError('installed or recovered candidate cannot be cancelled')
+
+
 def cancel_candidate(
     manifest: ManagedUpdateManifest,
     candidate: CandidateResult,
 ) -> Path:
+    with _repository_update_lock(manifest):
+        return _cancel_candidate_locked(manifest, candidate)
+
+
+def _cancel_candidate_locked(
+    manifest: ManagedUpdateManifest,
+    candidate: CandidateResult,
+) -> Path:
+    _ensure_candidate_cancellable(candidate.state_dir)
     final_path = candidate.state_dir / 'cancellation.json'
     if _path_lexists(final_path):
         final = _read_json_object(final_path)
@@ -1189,7 +1469,7 @@ def cancel_candidate(
             raise ManifestError('candidate has an invalid cancellation report')
         return final_path
 
-    persisted = load_candidate(candidate.state_dir, allow_cancelled=True)
+    persisted = _load_effective_candidate(candidate.state_dir, allow_cancelled=True)
     if persisted != candidate:
         raise ManifestError('candidate cancellation request does not match its persisted report')
 
@@ -1574,16 +1854,19 @@ def _validate_install_terminal_metadata(
 
 
 def _next_install_started_at(state_root: Path) -> int:
-    state_root = Path(state_root).expanduser().resolve()
-    if not state_root.is_dir() or state_root.is_symlink():
+    state_root = Path(state_root).expanduser()
+    if state_root.is_symlink() or not state_root.is_dir():
         raise ManifestError('managed update state root must be a real directory')
+    state_root = state_root.resolve()
 
     existing: set[int] = set()
     for state_dir in sorted(state_root.iterdir(), key=lambda item: item.name):
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', state_dir.name):
             continue
-        if not state_dir.is_dir() or state_dir.is_symlink():
-            continue
+        if state_dir.is_symlink() or not state_dir.is_dir():
+            raise ManifestError(
+                f'candidate state {state_dir.name!r} must be a real directory'
+            )
         transaction_path = state_dir / 'transaction.json'
         if not _path_lexists(transaction_path):
             continue
@@ -1607,7 +1890,10 @@ def _recover_install_transaction_locked(
     manifest: ManagedUpdateManifest,
     state_dir: Path,
 ) -> Path:
-    state_dir = Path(state_dir).resolve()
+    state_dir = Path(state_dir).expanduser()
+    if state_dir.is_symlink() or not state_dir.is_dir():
+        raise ManifestError('candidate state directory must be a real directory')
+    state_dir = state_dir.resolve()
     transaction = _read_json_object(state_dir / 'transaction.json')
     metadata = _validate_install_transaction_metadata(state_dir, transaction)
     if metadata.manifest_sha256 != manifest_digest(manifest):
@@ -1746,12 +2032,16 @@ def _recover_pending_install_transactions_locked(
     *,
     required_latest_state_dir: Path | None = None,
 ) -> tuple[Path, ...]:
-    state_root = Path(state_root).expanduser().resolve()
-    required_latest = (
-        Path(required_latest_state_dir).expanduser().resolve()
-        if required_latest_state_dir is not None
-        else None
-    )
+    state_root = Path(state_root).expanduser()
+    if state_root.is_symlink():
+        raise ManifestError('managed update state root must be a real directory')
+    state_root = state_root.resolve()
+    required_latest: Path | None = None
+    if required_latest_state_dir is not None:
+        required_path = Path(required_latest_state_dir).expanduser()
+        if required_path.is_symlink() or not required_path.is_dir():
+            raise ManifestError('candidate state directory must be a real directory')
+        required_latest = required_path.resolve()
     if not _path_lexists(state_root):
         if required_latest is not None:
             raise ManifestError('requested install transaction is not the latest install transaction')
@@ -1763,8 +2053,10 @@ def _recover_pending_install_transactions_locked(
     for state_dir in sorted(state_root.iterdir(), key=lambda item: item.name):
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', state_dir.name):
             continue
-        if not state_dir.is_dir() or state_dir.is_symlink():
-            continue
+        if state_dir.is_symlink() or not state_dir.is_dir():
+            raise ManifestError(
+                f'candidate state {state_dir.name!r} must be a real directory'
+            )
         transaction_path = state_dir / 'transaction.json'
         if not _path_lexists(transaction_path):
             continue
@@ -1810,7 +2102,10 @@ def recover_install_transaction(
     manifest: ManagedUpdateManifest,
     state_dir: Path,
 ) -> Path:
-    state_dir = Path(state_dir).expanduser().resolve()
+    state_dir = Path(state_dir).expanduser()
+    if state_dir.is_symlink() or not state_dir.is_dir():
+        raise ManifestError('candidate state directory must be a real directory')
+    state_dir = state_dir.resolve()
     with _repository_update_lock(manifest):
         reports = _recover_pending_install_transactions_locked(
             manifest,
@@ -1877,6 +2172,10 @@ def _install_verified_candidate_locked(
     copy_bundle: Callable[[Path, Path], None] = _default_copy_bundle,
     health_check: Callable[[Path], bool],
 ) -> InstallResult:
+    persisted_candidate = _load_effective_candidate(candidate.state_dir)
+    if persisted_candidate != candidate:
+        raise ManifestError('candidate state changed after verification')
+    candidate = persisted_candidate
     validate_install_approval(
         manifest,
         candidate,
@@ -2289,12 +2588,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if args.command == 'prepare':
-            if not args.no_fetch:
-                _fetch_configured_upstream(manifest)
-            candidate = prepare_candidate(
+            candidate, verified = _prepare_update(
                 manifest,
                 args.state_root,
                 candidate_id=args.candidate_id,
+                fetch=not args.no_fetch,
             )
             if candidate.status != 'ready':
                 _emit_event(
@@ -2319,7 +2617,8 @@ def main(argv: list[str] | None = None) -> int:
                     }
                 )
                 return 0
-            verified = verify_candidate(manifest, candidate)
+            if verified is None:
+                raise ManifestError('ready candidate was not verified under the repository lock')
             _emit_event(
                 {
                     'event': 'candidate-ready',
@@ -2339,29 +2638,27 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == 'resume-conflict':
             if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', args.candidate_id):
                 raise ManifestError('invalid candidate_id')
-            state_root = args.state_root.resolve()
-            state_dir = (state_root / args.candidate_id).resolve()
-            if state_dir.parent != state_root:
-                raise ManifestError('candidate state directory escapes state root')
-            conflict_candidate = load_candidate(state_dir)
-            resolution_path = state_dir / 'conflict-resolution.json'
-            verification_path = state_dir / 'verification.json'
-            if conflict_candidate.status == 'conflict':
-                candidate = resume_candidate_conflict(manifest, conflict_candidate)
-            elif (
-                conflict_candidate.status == 'ready'
-                and _path_lexists(resolution_path)
-                and not _path_lexists(verification_path)
-            ):
-                # A prior process may have durably recorded the resolution and then
-                # exited before verification. load_candidate already authenticates the
-                # immutable resolution, so retry only the missing verification phase.
-                candidate = conflict_candidate
-            else:
-                raise ManifestError(
-                    'candidate conflict cannot be resumed from its current durable state'
-                )
-            verified = verify_candidate(manifest, candidate)
+            with _repository_update_lock(manifest):
+                state_dir = _candidate_state_dir(args.state_root, args.candidate_id)
+                conflict_candidate = load_candidate(state_dir)
+                resolution_path = state_dir / 'conflict-resolution.json'
+                verification_path = state_dir / 'verification.json'
+                if conflict_candidate.status == 'conflict':
+                    candidate = resume_candidate_conflict(manifest, conflict_candidate)
+                elif (
+                    conflict_candidate.status == 'ready'
+                    and _path_lexists(resolution_path)
+                    and not _path_lexists(verification_path)
+                ):
+                    # A prior process may have durably recorded the resolution and then
+                    # exited before verification. load_candidate already authenticates the
+                    # immutable resolution, so retry only the missing verification phase.
+                    candidate = conflict_candidate
+                else:
+                    raise ManifestError(
+                        'candidate conflict cannot be resumed from its current durable state'
+                    )
+                verified = verify_candidate(manifest, candidate)
             _emit_event(
                 {
                     'event': 'candidate-ready',
@@ -2381,12 +2678,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == 'accept-review':
             if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', args.candidate_id):
                 raise ManifestError('invalid candidate_id')
-            state_root = args.state_root.resolve()
-            state_dir = (state_root / args.candidate_id).resolve()
-            if state_dir.parent != state_root:
-                raise ManifestError('candidate state directory escapes state root')
-            candidate = load_candidate(state_dir)
-            verified = accept_candidate_review(manifest, candidate)
+            with _repository_update_lock(manifest):
+                state_dir = _candidate_state_dir(args.state_root, args.candidate_id)
+                candidate = load_candidate(state_dir)
+                verification_path = state_dir / 'verification.json'
+                if _path_lexists(verification_path):
+                    raise ManifestError(
+                        f'candidate {candidate.candidate_id!r} already has verification state; '
+                        'install or cancel it'
+                    )
+                resumed = _candidate_after_persisted_review_decision(candidate)
+                if resumed.status == 'ready':
+                    candidate = resumed
+                    verified = verify_candidate(manifest, candidate)
+                else:
+                    verified = accept_candidate_review(manifest, candidate)
             _emit_event(
                 {
                     'event': 'candidate-ready',
@@ -2406,13 +2712,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == 'cancel':
             if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', args.candidate_id):
                 raise ManifestError('invalid candidate_id')
-            state_root = args.state_root.resolve()
-            state_dir = (state_root / args.candidate_id).resolve()
-            if state_dir.parent != state_root:
-                raise ManifestError('candidate state directory escapes state root')
-            invalidate_candidate_state(state_dir, args.candidate_id)
-            candidate = load_candidate(state_dir, allow_cancelled=True)
-            report = cancel_candidate(manifest, candidate)
+            with _repository_update_lock(manifest):
+                state_dir = _candidate_state_dir(args.state_root, args.candidate_id)
+                _invalidate_candidate_state_locked(state_dir, args.candidate_id)
+                candidate = _load_effective_candidate(state_dir, allow_cancelled=True)
+                report = _cancel_candidate_locked(manifest, candidate)
             _emit_event(
                 {
                     'event': 'candidate-cancelled',
@@ -2425,17 +2729,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == 'install':
             if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', args.candidate_id):
                 raise ManifestError('invalid candidate_id')
-            state_root = args.state_root.resolve()
-            state_dir = (state_root / args.candidate_id).resolve()
-            if state_dir.parent != state_root:
-                raise ManifestError('candidate state directory escapes state root')
+            state_dir = _candidate_state_dir(args.state_root, args.candidate_id)
             (
                 confirmation_token,
                 confirmed_candidate_sha,
                 confirmed_artifact_sha256,
                 confirmed_verification_report_sha256,
             ) = _read_install_approval_fd(args.approval_fd)
-            candidate = load_candidate(state_dir)
+            candidate = _load_effective_candidate(state_dir)
             verified = load_verified_candidate(state_dir, candidate)
             if not hmac.compare_digest(
                 confirmed_verification_report_sha256,
