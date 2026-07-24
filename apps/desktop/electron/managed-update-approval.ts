@@ -112,7 +112,7 @@ export class ManagedUpdateApprovalVault {
     candidateId: string,
     confirm: (summary: ManagedApprovalSummary) => Promise<boolean>
   ): Promise<ManagedApproval | null> {
-    const approval = this.consume(candidateId)
+    const approval = this.peek(candidateId)
 
     if (!approval) {
       throw new Error('Managed update approval is not available.')

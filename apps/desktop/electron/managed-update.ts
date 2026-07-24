@@ -272,7 +272,8 @@ export async function runManagedUpdateCommand(
       {
         env: {
           ...process.env,
-          HERMES_HOME: path.resolve(path.dirname(configuration.manifestPath), '..', '..')
+          HERMES_HOME: path.resolve(path.dirname(configuration.manifestPath), '..', '..'),
+          LANG: 'en_US.UTF-8'
         },
         shell: false,
         stdio: ['ignore', 'pipe', 'pipe']

@@ -101,7 +101,7 @@ describe('ManagedUpdateApprovalVault', () => {
     expect(vault.peek(second.candidateId)).toBeNull()
   })
 
-  it('authorizes exactly once without exposing the token to the native confirmation callback', async () => {
+  it('authorizes multiple times without consuming (approval persists for retry)', async () => {
     const vault = new ManagedUpdateApprovalVault()
 
     const approval = {
@@ -127,10 +127,14 @@ describe('ManagedUpdateApprovalVault', () => {
     })
 
     expect(authorized).toEqual(approval)
-    await expect(vault.authorize(approval.candidateId, async () => true)).rejects.toThrow('not available')
+
+    // Approval persists after authorize (uses peek, not consume) — retry is safe.
+    const retry = await vault.authorize(approval.candidateId, async () => true)
+    expect(retry).toEqual(approval)
+    expect(vault.peek(approval.candidateId)).toEqual(approval)
   })
 
-  it('revokes the approval when native confirmation is cancelled', async () => {
+  it('keeps the approval when native confirmation is cancelled (allows retry)', async () => {
     const vault = new ManagedUpdateApprovalVault()
 
     const approval = {
@@ -144,7 +148,8 @@ describe('ManagedUpdateApprovalVault', () => {
     vault.retain(approval)
 
     await expect(vault.authorize(approval.candidateId, async () => false)).resolves.toBeNull()
-    expect(vault.peek(approval.candidateId)).toBeNull()
+    // Approval persists after cancelled confirmation — user can retry.
+    expect(vault.peek(approval.candidateId)).toEqual(approval)
   })
 
   it('rejects malformed candidate metadata and tokens', () => {

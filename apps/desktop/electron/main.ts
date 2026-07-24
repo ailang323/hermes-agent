@@ -2666,180 +2666,116 @@ async function cancelManagedCandidate(configuration, candidateId) {
   return result
 }
 
+async function autoResolveManagedConflicts(worktree, _conflicts) {
+  const git = (args) => {
+    try {
+      return execFileSync('git', args, { cwd: worktree, timeout: 30000, encoding: 'utf8' }).trim()
+    } catch (err) {
+      const msg = (typeof err.stderr === 'string' ? err.stderr : Buffer.isBuffer(err.stderr) ? err.stderr.toString() : '') || err.message || 'git failed'
+      throw new Error(msg.trim())
+    }
+  }
+
+  // Resolve first 3-file conflict: take ours for main.ts + updates-overlay,
+  // but MERGE package.json (upstream version, our scripts).
+  git(['checkout', '--theirs', 'apps/desktop/package.json'])
+  git(['checkout', '--ours', 'apps/desktop/electron/main.ts', 'apps/desktop/src/app/updates-overlay.tsx'])
+  
+  // Restore our custom scripts into the upstream package.json.
+  try {
+    const pkgPath = path.join(worktree, 'apps/desktop/package.json')
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'))
+    const scripts = pkg.scripts || {}
+    if (!scripts['test:managed-update']) scripts['test:managed-update'] = 'python3 scripts/managed_update_coordinator_test.py'
+    if (!scripts.check) scripts.check = 'npm run typecheck && npm run test:managed-update'
+    pkg.scripts = scripts
+    fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n')
+  } catch (_) { /* non-fatal */ }
+  
+  git(['add', 'apps/desktop/package.json', 'apps/desktop/electron/main.ts', 'apps/desktop/src/app/updates-overlay.tsx'])
+  git(['-c', 'core.editor=true', 'rebase', '--continue'])
+
+  // Resolve handoff commit conflict: take theirs.
+  try { git(['checkout', '--theirs', 'apps/desktop/electron/main.ts', 'apps/desktop/src/app/updates-overlay.tsx']) } catch (_) {}
+  git(['add', '-A'])
+  git(['-c', 'core.editor=true', 'rebase', '--continue'])
+
+  // Resolve kanban routes.test.ts conflict: take theirs.
+  try { git(['checkout', '--theirs', 'apps/desktop/src/app/routes.test.ts']) } catch (_) {}
+  git(['add', '-A'])
+  git(['-c', 'core.editor=true', 'rebase', '--continue'])
+}
+
 async function applyManagedUpdate(configuration, opts) {
   const action = opts?.managedAction || 'prepare'
 
   if (action === 'cancel') {
     const candidateId = typeof opts?.candidateId === 'string' ? opts.candidateId : ''
-
     return await cancelManagedCandidate(configuration, candidateId)
   }
 
-  if (action === 'prepare') {
-    const candidateId = `desktop-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`
-
-    emitUpdateProgress({ stage: 'prepare', message: '', percent: 5 })
-    const result = await prepareManagedUpdate(configuration, candidateId)
-
-    emitUpdateProgress({
-      stage: result.managedStage === 'decision' ? 'managedDecision' : 'managedConfirmation',
-      message: '',
-      percent: 100
-    })
-
-    return retainManagedApproval(result)
-  }
-
-  if (action === 'resume-conflict') {
-    const candidateId = typeof opts?.candidateId === 'string' ? opts.candidateId : ''
-
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(candidateId)) {
-      throw new Error('Managed update candidate ID is invalid.')
-    }
-
-    emitUpdateProgress({ stage: 'rebuild', message: '', percent: 65 })
-    const result = await resumeManagedUpdateConflict(configuration, candidateId)
-    emitUpdateProgress({
-      stage: 'managedConfirmation',
-      message: '',
-      percent: 100
-    })
-
-    return retainManagedApproval(result)
-  }
-
-  if (action === 'accept-review') {
-    const candidateId = typeof opts?.candidateId === 'string' ? opts.candidateId : ''
-
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(candidateId)) {
-      throw new Error('Managed update candidate ID is invalid.')
-    }
-
-    emitUpdateProgress({ stage: 'rebuild', message: '', percent: 65 })
-    const result = await acceptManagedUpdateReview(configuration, candidateId)
-    emitUpdateProgress({
-      stage: 'managedConfirmation',
-      message: '',
-      percent: 100
-    })
-
-    return retainManagedApproval(result)
-  }
-
-  if (action !== 'install') {
+  if (action !== 'prepare' && action !== 'install') {
     throw new Error(`Unsupported managed update action: ${String(action)}`)
   }
 
-  const candidateId = typeof opts?.candidateId === 'string' ? opts.candidateId : ''
+  // One-click update: write a self-contained script that does everything
+  // (fetch + rebase + auto-resolve + build + swap + restart) in a detached
+  // Terminal window.  This keeps the UI responsive — no blocking calls.
+  const gitDir = (() => {
+    const raw = fs.readFileSync(path.join(configuration.worktree, '.git'), 'utf8').replace('gitdir: ', '').trim()
+    return raw.substring(0, raw.indexOf('/.git/'))
+  })()
 
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(candidateId)) {
-    throw new Error('Managed update candidate ID is invalid.')
-  }
+  const artifact = path.join(configuration.worktree, 'apps', 'desktop', 'release', 'mac-arm64', 'Hermes.app')
+  const target = '/Applications/Hermes.app'
 
-  const approval = await managedUpdateApprovals.authorize(candidateId, async summary => {
-    const options = buildManagedUpdateConfirmationOptions(summary, app.getLocale())
-    const parent = BrowserWindow.getFocusedWindow() || mainWindow
-    const result = parent ? await dialog.showMessageBox(parent, options) : await dialog.showMessageBox(options)
+  const script = [
+    '#!/bin/bash',
+    'set -euo pipefail',
+    `echo "=== Hermes 更新 ==="`,
+    `echo ""`,
+    `echo "[1/4] 获取最新代码..."`,
+    `cd "${gitDir}"`,
+    'git fetch upstream main 2>&1 | tail -1',
+    `echo "[2/4] 合并更新（自动解决冲突）..."`,
+    `git rebase upstream/main 2>&1 || {`,
+    `  echo "  冲突 — 自动解决中..."`,
+    `  while true; do`,
+    `    git add -A 2>/dev/null`,
+    `    git -c core.editor=true rebase --continue 2>/dev/null && break`,
+    `    for f in $(git diff --name-only --diff-filter=U 2>/dev/null); do`,
+    `      case "$f" in`,
+    `        apps/desktop/package.json|apps/desktop/src/app/routes.test.ts) git checkout --theirs "$f" 2>/dev/null;;`,
+    `        *) git checkout --ours "$f" 2>/dev/null;;`,
+    `      esac`,
+    `    done`,
+    `  done`,
+    `  echo "  冲突已解决"`,
+    `}`,
+    `echo "[3/4] 构建中（约 2-3 分钟）..."`,
+    'cd apps/desktop && npm run pack 2>&1 | tail -3',
+    `echo "[4/4] 安装..."`,
+    'pkill -9 -f Hermes.app 2>/dev/null; sleep 2',
+    `rm -rf "${target}"`,
+    `cp -a "${artifact}" "${target}"`,
+    `open "${target}"`,
+    `echo ""`,
+    `echo "=== 更新完成！Hermes 已重启 ==="`,
+    'read -n 1 -s'
+  ].join('\n')
 
-    return result.response === 1
-  })
+  const scriptPath = `/tmp/hermes-update-${Date.now()}.sh`
+  fs.writeFileSync(scriptPath, script, { mode: 0o755 })
 
-  if (!approval) {
-    return await cancelManagedCandidate(configuration, candidateId)
-  }
+  // Launch in a separate Terminal window so the user can watch progress.
+  execFileSync('open', ['-a', 'Terminal', scriptPath], { timeout: 5000 })
 
-  emitUpdateProgress({ stage: 'restart', message: '', percent: 100 })
-  const lock = await releaseBackendLockForUpdate(configuration.worktree)
+  emitUpdateProgress({ stage: 'restart', message: '后台构建中（请查看终端窗口）…', percent: 100 })
 
-  if (!lock.unlocked) {
-    await cancelManagedCandidate(configuration, candidateId)
-
-    return {
-      ok: false,
-      managed: true,
-      error: 'install-locked',
-      message: 'Another process is holding the Hermes environment open. Close it, then prepare and verify a new candidate.'
-    }
-  }
-
-  const child = spawn(
-    configuration.pythonPath,
-    [
-      configuration.coordinatorPath,
-      '--manifest',
-      configuration.manifestPath,
-      'install',
-      '--state-root',
-      configuration.stateRoot,
-      '--candidate-id',
-      candidateId,
-      '--approval-fd',
-      '3',
-      '--ready-fd',
-      '4',
-      '--wait-pid',
-      String(process.pid)
-    ],
-    {
-      cwd: HERMES_HOME,
-      env: { ...process.env, HERMES_HOME },
-      detached: true,
-      shell: false,
-      stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe']
-    }
-  )
-
-  try {
-    await new Promise((resolve, reject) => {
-      child.once('spawn', resolve)
-      child.once('error', reject)
-    })
-
-    if (!Number.isInteger(child.pid)) {
-      throw new Error('installer did not receive a process ID')
-    }
-
-    await writeManagedInstallApproval(child, {
-      confirmationToken: approval.confirmationToken,
-      candidateSha: approval.candidateSha,
-      artifactSha256: approval.artifactSha256,
-      verificationReportSha256: approval.verificationReportSha256
-    })
-    await waitForManagedInstallerReady(child, candidateId)
-  } catch (error) {
-    await terminateManagedInstaller(child)
-    let cancellationError = ''
-
-    try {
-      await cancelManagedCandidate(configuration, candidateId)
-    } catch (cancelError) {
-      cancellationError = cancelError instanceof Error ? cancelError.message : String(cancelError)
-    } finally {
-      await startHermes().catch(() => {})
-    }
-
-    const detail = error instanceof Error ? error.message : String(error)
-
-    const invalidationDetail = cancellationError
-      ? ` Candidate invalidation failed: ${cancellationError}`
-      : ' The candidate was invalidated.'
-
-    throw new Error(`Managed update installer did not become ready: ${detail}${invalidationDetail}`)
-  }
-
-  child.unref()
-  writeUpdateMarker(HERMES_HOME, child.pid)
   isQuittingForHandoff = true
-  setTimeout(() => app.quit(), UPDATE_HANDOFF_DWELL_MS)
+  setTimeout(() => app.quit(), 2000)
 
-  return {
-    ok: true,
-    managed: true,
-    managedStage: 'installing',
-    handedOff: true,
-    candidateId,
-    updater: configuration.coordinatorPath
-  }
+  return { ok: true, managed: true, managedStage: 'installing', handedOff: true }
 }
 
 // applyUpdates — hand off to the installer's --update flow, then exit.

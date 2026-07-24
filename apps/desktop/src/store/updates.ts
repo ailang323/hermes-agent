@@ -75,6 +75,12 @@ export const resetUpdateApplyState = () => {
   $backendUpdateApply.set(IDLE)
 }
 
+function extractCandidateIdFromMessage(message: string): string | null {
+  const match = message.match(/candidate '([^']+)'/)
+
+  return match?.[1] ?? null
+}
+
 const UPDATE_TOAST_ID = 'desktop-update-available'
 // Time-based snooze instead of per-sha dismissal: this repo lands ~100 commits
 // a day, so a "don't show this exact sha again" guard re-popped the toast on
@@ -396,6 +402,54 @@ export async function applyUpdates(opts: DesktopUpdateApplyOptions = {}): Promis
       resetUpdateApplyState()
 
       return result
+    }
+
+    // Auto-recover from "already has verification state" — the candidate is
+    // already verified, so skip prepare and go straight to install.
+    if (
+      !result?.ok &&
+      result?.error === 'apply-failed' &&
+      typeof result?.message === 'string' &&
+      result.message.includes('already has verification state')
+    ) {
+      const candidateId = extractCandidateIdFromMessage(result.message)
+
+      if (candidateId) {
+        $updateApply.set({
+          ...IDLE,
+          applying: true,
+          stage: 'restart',
+          message: 'Installing verified candidate…',
+          managedRequest: { managedAction: 'install', candidateId }
+        })
+
+        const installResult = await bridge.apply({ managedAction: 'install', candidateId })
+
+        if (installResult?.ok) {
+          setUpdateOverlayOpen(false)
+          resetUpdateApplyState()
+          notify({
+            durationMs: 8000,
+            id: UPDATE_TOAST_ID,
+            kind: 'success',
+            message: translateNow('updates.manualPickedUp'),
+            placement: 'default',
+            title: translateNow('updates.allSetTitle')
+          })
+
+          return installResult
+        }
+
+        $updateApply.set({
+          ...$updateApply.get(),
+          applying: false,
+          stage: 'error',
+          error: installResult?.error ?? 'install-failed',
+          message: installResult?.message ?? translateNow('updates.errorBody')
+        })
+
+        return installResult
+      }
     }
 
     if (result?.managed && result.managedStage === 'decision') {
