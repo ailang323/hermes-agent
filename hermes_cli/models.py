@@ -2534,6 +2534,12 @@ _MODELS_DEV_PREFERRED: frozenset[str] = frozenset({
     "zai",
     "gemini",
     "google",
+    # kimi-coding / kimi-coding-cn: the Kimi Code endpoint does not implement
+    # /models, so provider_model_ids() always falls back to the static curated
+    # list.  Opt into the models.dev merge so new models surface in the picker
+    # without waiting for a Hermes release.
+    "kimi-coding",
+    "kimi-coding-cn",
 })
 
 
