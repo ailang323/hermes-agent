@@ -176,6 +176,7 @@ import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeig
 import { resolveBehindCount, shouldCountCommits } from './update-count'
 import { readLiveUpdateMarker, writeUpdateMarker } from './update-marker'
 import { runRebuildWithRetry } from './update-rebuild'
+import { buildManagedUpdateCommand, parseManagedUpdateStatus } from './custom-update-handoff'
 import {
   buildRelaunchScript,
   collectRelaunchArgs,
@@ -3115,6 +3116,83 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`
 }
 
+async function handOffToManagedDesktopTransaction(updater, updateRoot, env) {
+  const runId = `desktop-button-${new Date().toISOString().replace(/[:.]/g, '-')}`
+  const runDir = path.join(HERMES_HOME, 'update-runs', runId)
+  const scriptPath = path.join(runDir, 'run-update.command')
+  const statusPath = path.join(runDir, 'status')
+  const logPath = path.join(runDir, 'install.log')
+  const command = buildManagedUpdateCommand({ updater, runDir, hermesHome: HERMES_HOME })
+
+  try {
+    fs.mkdirSync(runDir, { recursive: true })
+    fs.writeFileSync(scriptPath, command, { mode: 0o700 })
+  } catch (err) {
+    const failure = '更新未能启动：安全事务脚本创建失败。正式应用没有被替换。'
+    emitUpdateProgress({ stage: 'error', message: failure, error: err.message || 'transaction-script-failed' })
+    rememberLog(`[updates] managed desktop transaction script failed: ${err.message}`)
+
+    return { ok: false, error: failure }
+  }
+
+  emitUpdateProgress({
+    stage: 'update',
+    message: '正在执行完整安全更新；验证完成后 Hermes 会自动安装并重启…',
+    percent: 10
+  })
+  rememberLog(`[updates] managed desktop transaction updater: ${updater}; run=${runDir}`)
+
+  const launched = (await runStreamedUpdate('/usr/bin/open', ['-a', 'Terminal', scriptPath], {
+    cwd: updateRoot,
+    env,
+    stage: 'update'
+  })) as any
+
+  if (launched.code !== 0) {
+    const failure = '更新未能启动：无法打开独立安装事务。正式应用没有被替换。'
+    emitUpdateProgress({ stage: 'error', message: failure, error: launched.error || 'transaction-launch-failed' })
+    rememberLog(`[updates] managed desktop transaction launch failed: ${launched.error || launched.code}`)
+
+    return { ok: false, error: failure }
+  }
+
+  // The updater keeps this app alive while it fetches, tests and builds, then
+  // asks macOS to quit it immediately before the atomic App+plugin commit. If a
+  // pre-install step fails, this process remains alive and can surface the
+  // status instead of leaving the user to interpret a detached Terminal.
+  const deadline = Date.now() + 2 * 60 * 60 * 1000
+
+  while (Date.now() < deadline) {
+    let status: ReturnType<typeof parseManagedUpdateStatus> = { state: 'running' }
+
+    try {
+      status = parseManagedUpdateStatus(fs.readFileSync(statusPath, 'utf8'))
+    } catch {
+      // The status file is created atomically only when the transaction exits.
+    }
+
+    if (status.state === 'succeeded') {
+      return { ok: true, handedOff: true, updater, runDir, logPath }
+    }
+
+    if (status.state === 'failed') {
+      const failure = '更新未完成：安全事务已停止，正式应用已保留或自动回滚。'
+      emitUpdateProgress({ stage: 'error', message: failure, error: `transaction-exit-${status.exitCode}` })
+      rememberLog(`[updates] managed desktop transaction failed: exit=${status.exitCode}; log=${logPath}`)
+
+      return { ok: false, error: failure, runDir, logPath }
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 1000))
+  }
+
+  const timeout = '更新状态等待超时：事务可能仍在执行，请勿重复点击更新。'
+  emitUpdateProgress({ stage: 'error', message: timeout, error: 'transaction-status-timeout' })
+  rememberLog(`[updates] managed desktop transaction status timeout; run=${runDir}`)
+
+  return { ok: false, error: timeout, runDir, logPath }
+}
+
 // macOS/Linux in-app update: backend (`hermes update`) + OS-aware GUI rebuild
 // (`hermes desktop --build-only`), then atomically swap the running .app bundle
 // with the freshly built one and relaunch. Degrades to "backend updated,
@@ -3173,6 +3251,17 @@ async function applyUpdatesPosixInApp(opts: any) {
     env.HERMES_DESKTOP_CHILD_PID = desktopChildPids.join(',')
   }
 
+  // Local customized macOS installs have a single audited end-to-end updater.
+  // Hand the update button to it instead of duplicating source/build/install in
+  // this process: the transaction preserves Framework symlinks with cp -a,
+  // verifies the exact candidate, publishes the app and quota plugin together,
+  // rolls both back on failure, and relaunches only after a healthy install.
+  const customTransactionUpdater = path.join(HERMES_HOME, 'bin', 'hermes-longer-update')
+
+  if (IS_MAC && isExecutableFile(customTransactionUpdater)) {
+    return await handOffToManagedDesktopTransaction(customTransactionUpdater, updateRoot, env)
+  }
+
   // Branch-pin so a non-main checkout doesn't get switched to main (and self-heal
   // to main when the pinned branch no longer exists on origin).
   let branchArgs = []
@@ -3188,18 +3277,38 @@ async function applyUpdatesPosixInApp(opts: any) {
     // best effort
   }
 
+  // `hermes update` fast-forwards, or hard-resets onto origin/<branch> when the
+  // history has diverged. A checkout carrying committed local customizations IS
+  // diverged the moment upstream advances, so that reset silently deletes them.
+  // When a customization-aware source updater is installed, drive this one step
+  // through it instead: it fetches upstream and rebases the local patch stack on
+  // top, and leaves the tree untouched (non-zero exit) when the rebase
+  // conflicts. Everything below — rebuild, bundle swap, relaunch — is unchanged.
+  const customSourceUpdater = path.join(HERMES_HOME, 'bin', 'hermes-source-update')
+  const useCustomSourceUpdater = !IS_WINDOWS && isExecutableFile(customSourceUpdater)
+
   emitUpdateProgress({ stage: 'update', message: 'Updating Hermes (git + dependencies)…', percent: 10 })
 
-  const updated = (await runStreamedUpdate(hermes, ['update', '--yes', ...branchArgs], {
-    cwd: updateRoot,
-    env,
-    stage: 'update'
-  })) as any
+  if (useCustomSourceUpdater) {
+    rememberLog(`[updates] source step via customization-aware updater: ${customSourceUpdater}`)
+  }
+
+  const updated = (await (useCustomSourceUpdater
+    ? runStreamedUpdate(customSourceUpdater, [], { cwd: updateRoot, env, stage: 'update' })
+    : runStreamedUpdate(hermes, ['update', '--yes', ...branchArgs], {
+        cwd: updateRoot,
+        env,
+        stage: 'update'
+      }))) as any
 
   if (updated.code !== 0) {
-    emitUpdateProgress({ stage: 'error', message: 'hermes update failed.', error: updated.error || 'update-failed' })
+    const failure = useCustomSourceUpdater
+      ? '更新未完成：同步新版本或合并本地定制时没有成功。系统已安全停止，正式应用没有被替换。'
+      : 'hermes update failed.'
 
-    return { ok: false, error: 'hermes update failed' }
+    emitUpdateProgress({ stage: 'error', message: failure, error: updated.error || 'update-failed' })
+
+    return { ok: false, error: failure }
   }
 
   emitUpdateProgress({ stage: 'rebuild', message: 'Rebuilding the desktop app…', percent: 60 })
