@@ -2,6 +2,8 @@ import { atom } from 'nanostores'
 
 import { triggerHaptic } from '@/lib/haptics'
 
+import { $queuedPromptsBySession } from './composer-queue'
+
 export interface ComposerAttachment {
   id: string
   kind: 'image' | 'file' | 'folder' | 'terminal' | 'url'
@@ -19,9 +21,73 @@ export interface ComposerAttachment {
 
 export const $composerDraft = atom('')
 export const $composerAttachments = atom<ComposerAttachment[]>([])
-export const $composerContextReferences = atom<Record<string, string>>({})
+
+// Draft TEXT is persisted (see SESSION_DRAFTS_STORAGE_KEY), so a draft holding a
+// `@selection:_selection` chip outlives a restart. The text that chip stands for
+// has to be persisted with it: otherwise the chip comes back as a dud — it still
+// looks like a reference, has nothing to show on hover, and
+// composerContextBlocksFromDraft() silently contributes NOTHING to the prompt.
+// The user believes they attached context and never sent any.
+export const CONTEXT_REFS_STORAGE_KEY = 'hermes:composer-context-refs:v1'
+
+/** Total serialized budget. Quoted selections can be whole messages, and this
+ *  shares a ~5MB localStorage quota with drafts and other stores. */
+const MAX_PERSISTED_CONTEXT_REF_BYTES = 256 * 1024
+
+function loadPersistedContextReferences(): Record<string, string> {
+  try {
+    const raw = window.localStorage.getItem(CONTEXT_REFS_STORAGE_KEY)
+    const parsed = raw ? JSON.parse(raw) : null
+
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return {}
+    }
+
+    const entries = Object.entries(parsed as Record<string, unknown>).filter(
+      (entry): entry is [string, string] => typeof entry[1] === 'string' && entry[1].length > 0
+    )
+
+    return Object.fromEntries(entries)
+  } catch {
+    return {}
+  }
+}
+
+export const $composerContextReferences = atom<Record<string, string>>(loadPersistedContextReferences())
 // Back-compatible alias for existing terminal-selection callers.
 export const $composerTerminalSelections = $composerContextReferences
+
+function persistContextReferences(refs: Record<string, string>) {
+  try {
+    const entries = Object.entries(refs)
+
+    if (entries.length === 0) {
+      window.localStorage.removeItem(CONTEXT_REFS_STORAGE_KEY)
+
+      return
+    }
+
+    // Drop oldest-first until the payload fits. Insertion order is quote order,
+    // so the reference the user just made is the last one to be sacrificed.
+    let kept = entries
+
+    while (kept.length > 0 && JSON.stringify(Object.fromEntries(kept)).length > MAX_PERSISTED_CONTEXT_REF_BYTES) {
+      kept = kept.slice(1)
+    }
+
+    if (kept.length === 0) {
+      window.localStorage.removeItem(CONTEXT_REFS_STORAGE_KEY)
+
+      return
+    }
+
+    window.localStorage.setItem(CONTEXT_REFS_STORAGE_KEY, JSON.stringify(Object.fromEntries(kept)))
+  } catch {
+    // Best-effort only — quota/private-mode must never break quoting.
+  }
+}
+
+$composerContextReferences.listen(persistContextReferences)
 
 // ---------------------------------------------------------------------------
 // Composer scopes — one live attachment set PER MOUNTED COMPOSER. The main
@@ -134,6 +200,61 @@ function loadPersistedDraftTexts(): [string, SessionDraft][] {
 }
 
 const draftsBySession = new Map<string, SessionDraft>(loadPersistedDraftTexts())
+
+/**
+ * Keys some composer-owned text still mentions — every persisted per-session
+ * draft, persisted queued prompt, and the live composer text.
+ *
+ * A reference whose chip the user deleted is no longer live, which is what lets
+ * its label be handed out again. Without this, `nextComposerContextReferenceLabel`
+ * treated every reference ever created as taken and the label climbed forever
+ * (`_selection-2`, `-3`, …) even though the composer was empty.
+ *
+ * Liveness is derived rather than pruned on edit on purpose: the references map is
+ * global while drafts are per-session, so reconciling against one session's draft
+ * would delete another session's references — and a reference is created a tick
+ * before its chip reaches the draft, so an eager prune races the insert.
+ */
+function liveContextReferenceKeys() {
+  const keys = new Set<string>()
+  const texts = [...draftsBySession.values()].map(draft => draft.text)
+
+  texts.push($composerDraft.get())
+
+  for (const queue of Object.values($queuedPromptsBySession.get())) {
+    texts.push(...queue.map(entry => entry.text))
+  }
+
+  for (const text of texts) {
+    if (!text) {
+      continue
+    }
+
+    for (const ref of contextReferencesFromDraft(text)) {
+      keys.add(contextReferenceKey(ref.kind, ref.label))
+    }
+  }
+
+  return keys
+}
+
+/** Drop persisted references no draft mentions any more — chips deleted in an
+ *  earlier session. Only safe at module load, when no insert is in flight. */
+function pruneOrphanedContextReferences() {
+  const current = $composerContextReferences.get()
+  const keys = Object.keys(current)
+
+  if (keys.length === 0) {
+    return
+  }
+
+  const live = liveContextReferenceKeys()
+  const next = Object.fromEntries(keys.filter(key => live.has(key)).map(key => [key, current[key] as string]))
+
+  if (Object.keys(next).length !== keys.length) {
+    $composerContextReferences.set(next)
+  }
+}
 
 function persistDraftTexts() {
   try {
@@ -328,16 +449,18 @@ function setComposerContextReference(kind: ComposerContextReferenceKind, label: 
 
 export function nextComposerContextReferenceLabel(kind: ComposerContextReferenceKind, baseLabel: string) {
   const base = baseLabel.trim() || (kind === 'selection' ? '_selection' : 'selection')
-  const current = $composerContextReferences.get()
+  // Only labels a draft still shows are taken. Reusing a stale label is correct:
+  // setComposerContextReference overwrites its text, and nothing references it.
+  const taken = liveContextReferenceKeys()
 
-  if (!current[contextReferenceKey(kind, base)]) {
+  if (!taken.has(contextReferenceKey(kind, base))) {
     return base
   }
 
   for (let index = 2; index < 1000; index += 1) {
     const candidate = `${base}-${index}`
 
-    if (!current[contextReferenceKey(kind, candidate)]) {
+    if (!taken.has(contextReferenceKey(kind, candidate))) {
       return candidate
     }
   }
@@ -353,9 +476,36 @@ export function setComposerSelectionReference(label: string, text: string) {
   setComposerContextReference('selection', label, text)
 }
 
+/** Max characters surfaced in a chip tooltip. A quoted selection can be the whole
+ *  message; an unbounded native tooltip would cover the window. */
+const CONTEXT_REF_PREVIEW_LIMIT = 600
+
+/**
+ * The referenced text behind a composer chip, for hover preview.
+ *
+ * A `@selection:` / `@terminal:` chip only carries a synthetic label
+ * (`_selection`, `_selection-2`) — the quoted text lives here in the store, so
+ * the chip has nothing readable in it. Callers use this to show what was quoted.
+ * Returns '' when the label is unknown, so a caller can skip the tooltip.
+ */
+export function composerContextReferenceText(kind: string, label: string) {
+  if (!isComposerContextReferenceKind(kind)) {
+    return ''
+  }
+
+  const text = $composerContextReferences.get()[contextReferenceKey(kind, label.trim())] || ''
+
+  return text.length > CONTEXT_REF_PREVIEW_LIMIT ? `${text.slice(0, CONTEXT_REF_PREVIEW_LIMIT)}…` : text
+}
+
 export function reconcileComposerContextReferences(draft: string) {
   const current = $composerContextReferences.get()
-  const keys = new Set(contextReferencesFromDraft(draft).map(ref => contextReferenceKey(ref.kind, ref.label)))
+  const keys = liveContextReferenceKeys()
+
+  for (const ref of contextReferencesFromDraft(draft)) {
+    keys.add(contextReferenceKey(ref.kind, ref.label))
+  }
+
   let changed = false
   const next: Record<string, string> = {}
 
@@ -426,3 +576,8 @@ function upsertAttachment(attachments: ComposerAttachment[], attachment: Compose
 
   return next
 }
+
+// Runs LAST on purpose: this reads CONTEXT_REF_RE (via contextReferencesFromDraft),
+// a `const` declared further up. Calling it where the helper is defined puts the
+// call above that initializer and throws on the temporal dead zone at import.
+pruneOrphanedContextReferences()

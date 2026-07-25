@@ -50,6 +50,7 @@ import { titlebarHeaderBaseClass, titlebarHeaderShadowClass, titlebarHeaderTitle
 import { ChatDropOverlay } from './chat-drop-overlay'
 import { ChatSwapOverlay } from './chat-swap-overlay'
 import { ChatBar, ChatBarFallback } from './composer'
+import { ComposerChipPreview } from './composer/chip-preview'
 import { requestComposerInsert } from './composer/focus'
 import { droppedFileInlineRefs } from './composer/inline-refs'
 import { useComposerScope } from './composer/scope'
@@ -587,6 +588,10 @@ export function ChatView({
             />
           </Suspense>
         )}
+        {/* Mounted here, once: it installs a document-level pointer listener that
+            serves every composer instance. Mounting it inside the composer would
+            duplicate the listener per session tile and stack panels. */}
+        <ComposerChipPreview />
       </ChatRuntimeBoundary>
     </div>
   )

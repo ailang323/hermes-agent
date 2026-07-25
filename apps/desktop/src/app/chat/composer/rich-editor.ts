@@ -16,6 +16,7 @@ import {
   type SlashChipKind,
   slashIconElement
 } from '@/components/assistant-ui/directive-text'
+import { composerContextReferenceText } from '@/store/composer'
 
 export const RICH_INPUT_SLOT = 'composer-rich-input'
 
@@ -52,27 +53,53 @@ export function quoteRefValue(value: string) {
   return formatRefValue(value)
 }
 
+/**
+ * Hover preview text for a chip whose visible label is only a placeholder.
+ *
+ * A quoted selection inserts `@selection:_selection`, so the chip reads
+ * "_selection" while the text it stands for lives in the composer store — there
+ * is nothing readable in the chip itself. Ordinary refs (files, folders, urls)
+ * already show their own label and get no preview.
+ *
+ * Carried on the element as `data-ref-preview` rather than `title`: a native
+ * tooltip takes 1–2s to appear and is routinely suppressed after pointer
+ * movement, which reads as "hovering does nothing". ChipPreview renders it.
+ */
+function refChipPreview(kind: string, id: string) {
+  return composerContextReferenceText(kind, id)
+}
+
 export function refChipHtml(kind: string, rawValue: string, displayLabel?: string) {
   const id = unquoteRef(rawValue)
   const text = `@${kind}:${quoteRefValue(id)}`
+  const preview = refChipPreview(kind, id)
+  const previewAttr = preview ? ` data-ref-preview="${escapeHtml(preview)}"` : ''
+  const titleAttr = preview ? '' : ` title="${escapeHtml(id)}"`
 
   const label = displayLabel || refChipLabel(kind, id)
 
-  return `<span contenteditable="false" title="${escapeHtml(id)}" data-ref-text="${escapeHtml(text)}" data-ref-id="${escapeHtml(id)}" data-ref-kind="${escapeHtml(kind)}" class="${DIRECTIVE_CHIP_CLASS}">${directiveIconSvg(kind)}<span class="truncate">${escapeHtml(label)}</span></span>`
+  return `<span contenteditable="false"${titleAttr} data-ref-text="${escapeHtml(text)}" data-ref-id="${escapeHtml(id)}" data-ref-kind="${escapeHtml(kind)}" class="${DIRECTIVE_CHIP_CLASS}"${previewAttr}>${directiveIconSvg(kind)}<span class="truncate">${escapeHtml(label)}</span></span>`
 }
 
 export function refChipElement(kind: string, rawValue: string, displayLabel?: string) {
   const id = unquoteRef(rawValue)
   const text = `@${kind}:${quoteRefValue(id)}`
+  const preview = refChipPreview(kind, id)
   const chip = document.createElement('span')
   const label = document.createElement('span')
 
   chip.contentEditable = 'false'
-  chip.title = id
   chip.dataset.refText = text
   chip.dataset.refId = id
   chip.dataset.refKind = kind
   chip.className = DIRECTIVE_CHIP_CLASS
+
+  if (preview) {
+    chip.dataset.refPreview = preview
+  } else {
+    chip.title = id
+  }
+
   label.className = 'truncate'
   label.textContent = displayLabel || refChipLabel(kind, id)
   chip.append(directiveIconElement(kind), label)
