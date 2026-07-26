@@ -152,10 +152,10 @@ def test_codex_usage_does_not_swap_to_pool_on_transient_resolver_error(monkeypat
     assert calls == []  # HTTP usage endpoint never hit with a wrong-account token
 
 
-def test_codex_usage_account_id_read_failure_keeps_singleton_token(monkeypatch, codex_usage_payload):
-    """When the resolver succeeds but the separate account_id read raises, the
-    working singleton token must still be used (best-effort account_id), NOT
-    abandoned in favor of a header-less pool credential."""
+def test_codex_usage_opaque_resolver_token_omits_account_header_without_pool_fallback(
+    monkeypatch, codex_usage_payload
+):
+    """Keep the selected runtime token but never borrow an unrelated account ID."""
     calls = []
     monkeypatch.setattr(
         account_usage.httpx,
@@ -170,14 +170,6 @@ def test_codex_usage_account_id_read_failure_keeps_singleton_token(monkeypatch, 
             "base_url": "https://chatgpt.com/backend-api/codex",
         },
     )
-    monkeypatch.setattr(
-        account_usage,
-        "_read_codex_tokens",
-        lambda *a, **k: (_ for _ in ()).throw(
-            account_usage.AuthError("partial store", provider="openai-codex", code="codex_auth_invalid_shape")
-        ),
-    )
-
     import agent.credential_pool as credential_pool
 
     monkeypatch.setattr(

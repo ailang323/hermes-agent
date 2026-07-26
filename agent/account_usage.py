@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING, Any, Optional
 import httpx
 
 from agent.anthropic_adapter import _is_oauth_token, resolve_anthropic_token
-from hermes_cli.auth import AuthError, _read_codex_tokens, resolve_codex_runtime_credentials
+from hermes_cli.auth import (
+    AuthError,
+    _decode_jwt_claims,
+    resolve_codex_runtime_credentials,
+)
 from hermes_cli.runtime_provider import resolve_runtime_provider
 
 if TYPE_CHECKING:
@@ -452,20 +456,58 @@ def _resolve_codex_usage_url(base_url: str) -> str:
     return _codex_backend_urls(base_url)[0]
 
 
+def _first_nonblank_string(*values: Any) -> Optional[str]:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _codex_account_metadata_from_token(
+    token: str,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Extract display-only Codex identity from an already-resolved token.
+
+    OpenAI's usage response does not consistently include account metadata.
+    The access token already selected by Hermes carries the same account's
+    profile/auth claims, so use those as a fallback without opening credential
+    files or exposing token material to callers.
+    """
+    claims = _decode_jwt_claims(token)
+    raw_profile = claims.get("https://api.openai.com/profile")
+    profile: dict[str, Any] = raw_profile if isinstance(raw_profile, dict) else {}
+    raw_auth = claims.get("https://api.openai.com/auth")
+    auth: dict[str, Any] = raw_auth if isinstance(raw_auth, dict) else {}
+
+    email = _first_nonblank_string(
+        profile.get("email"),
+        claims.get("email"),
+        claims.get("preferred_username"),
+        claims.get("upn"),
+    )
+    label = _first_nonblank_string(profile.get("name"), claims.get("name"))
+    account_id = _first_nonblank_string(
+        auth.get("chatgpt_account_id"),
+        claims.get("account_id"),
+    )
+    return email, label, account_id
+
+
 def _resolve_codex_usage_credentials(
     base_url: Optional[str],
     api_key: Optional[str],
 ) -> tuple[str, str, Optional[str]]:
     """Resolve Codex quota credentials from the native runtime path.
 
-    Prefer explicit live-agent credentials, then the legacy singleton OAuth
-    state, then the credential pool.  Hermes's native OAuth setup now stores
-    device-code logins in the pool, so quota diagnostics must not depend only
-    on the older singleton store.
+    Prefer explicit live-agent credentials, then the native runtime resolver,
+    then the credential pool. Account identity is derived only from the exact
+    token returned for this request; an unrelated singleton ID must never be
+    combined with a pool/runtime credential.
     """
     explicit_key = str(api_key or "").strip()
     if explicit_key:
-        return explicit_key, str(base_url or "").strip(), None
+        token_account_id = _codex_account_metadata_from_token(explicit_key)[2]
+        return explicit_key, str(base_url or "").strip(), token_account_id
 
     # Tier 2: the native runtime resolver. It ALREADY falls back to the
     # credential pool when the singleton is empty (see
@@ -479,35 +521,28 @@ def _resolve_codex_usage_credentials(
     # propagate — the outer ``fetch_account_usage`` guard fails open (shows
     # nothing this turn) rather than reporting the wrong account.
     #
-    # The ``account_id`` (for the ``ChatGPT-Account-Id`` header) is read
-    # best-effort: a partial/missing singleton token store must not sink an
-    # otherwise-usable resolver credential and force a header-less pool fallback.
     try:
         creds = resolve_codex_runtime_credentials(refresh_if_expiring=True)
-        account_id: Optional[str] = None
-        try:
-            token_data = _read_codex_tokens()
-            tokens = token_data.get("tokens") or {}
-            account_id = str(tokens.get("account_id", "") or "").strip() or None
-        except AuthError:
-            # Pool-only creds carry no singleton account_id; header is optional.
-            logger.debug("codex ▸ /usage account_id read failed (best-effort)", exc_info=True)
-        return creds["api_key"], str(creds.get("base_url", "") or "").strip(), account_id
+        token = creds["api_key"]
+        token_account_id = _codex_account_metadata_from_token(token)[2]
+        return token, str(creds.get("base_url", "") or "").strip(), token_account_id
     except AuthError:
         logger.debug("codex ▸ /usage runtime resolver returned no creds; trying pool", exc_info=True)
 
     # Tier 3: direct pool select. Reached only when the resolver itself raises
     # AuthError (e.g. singleton missing AND its own pool read found nothing at
-    # resolve time, but a pool entry is usable now). Pool credentials have no
-    # account_id concept, so the ChatGPT-Account-Id header is intentionally
-    # omitted here.
+    # resolve time, but a pool entry is usable now). The pool entry has no
+    # separate account_id field, but a Codex JWT may carry the matching ID in
+    # its auth claims.
     from agent.credential_pool import load_pool
 
     pool = load_pool("openai-codex")
     entry = pool.select()
     if entry is None:
         raise RuntimeError("No available openai-codex credential in credential pool")
-    return entry.runtime_api_key, str(entry.runtime_base_url or base_url or "").strip(), None
+    token = entry.runtime_api_key
+    token_account_id = _codex_account_metadata_from_token(token)[2]
+    return token, str(entry.runtime_base_url or base_url or "").strip(), token_account_id
 
 
 def _fetch_codex_account_usage(
@@ -526,11 +561,17 @@ def _fetch_codex_account_usage(
         response = client.get(_resolve_codex_usage_url(resolved_base_url), headers=headers)
         response.raise_for_status()
     payload = response.json() or {}
+    token_email, token_label, token_account_id = _codex_account_metadata_from_token(token)
     raw_account = payload.get("account")
     account: dict[str, Any] = raw_account if isinstance(raw_account, dict) else {}
-    account_email = payload.get("account_email") or account.get("email")
-    account_label = payload.get("account_label") or account.get("label")
-    payload_account_id = payload.get("account_id") or account.get("id")
+    account_email = _first_nonblank_string(
+        payload.get("account_email"),
+        account.get("email"),
+        payload.get("email"),
+        token_email,
+    )
+    account_label = _first_nonblank_string(payload.get("account_label"), account.get("label"), token_label)
+    payload_account_id = _first_nonblank_string(payload.get("account_id"), account.get("id"), token_account_id)
     rate_limit = payload.get("rate_limit") or {}
     windows: list[AccountUsageWindow] = []
     for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
@@ -566,11 +607,9 @@ def _fetch_codex_account_usage(
         source="usage_api",
         fetched_at=_utc_now(),
         plan=_title_case_slug(payload.get("plan_type")),
-        account_email=str(account_email).strip() if account_email else None,
-        account_label=str(account_label).strip() if account_label else None,
-        account_id=str(payload_account_id or account_id).strip()
-        if (payload_account_id or account_id)
-        else None,
+        account_email=account_email,
+        account_label=account_label,
+        account_id=_first_nonblank_string(payload_account_id, account_id),
         windows=tuple(windows),
         details=tuple(details),
     )

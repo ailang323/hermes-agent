@@ -1,3 +1,5 @@
+import base64
+import json
 from datetime import datetime, timezone
 
 from agent.account_usage import (
@@ -24,6 +26,7 @@ class _Response:
 class _Client:
     def __init__(self, payload):
         self._payload = payload
+        self.last_headers = None
 
     def __enter__(self):
         return self
@@ -32,6 +35,7 @@ class _Client:
         return False
 
     def get(self, url, headers=None):
+        self.last_headers = headers
         return _Response(self._payload)
 
 
@@ -58,15 +62,13 @@ def test_fetch_account_usage_codex(monkeypatch):
             "api_key": "access-token",
         },
     )
-    monkeypatch.setattr(
-        "agent.account_usage._read_codex_tokens",
-        lambda: {"tokens": {"account_id": "acct_123"}},
-    )
+
     monkeypatch.setattr(
         "agent.account_usage.httpx.Client",
         lambda timeout=15.0: _Client(
             {
                 "account_email": "codex-user@example.com",
+                "account_id": "acct_123",
                 "plan_type": "pro",
                 "rate_limit": {
                     "primary_window": {
@@ -96,6 +98,153 @@ def test_fetch_account_usage_codex(monkeypatch):
     assert snapshot.windows[0].used_percent == 15.0
     assert snapshot.windows[0].reset_at == datetime.fromtimestamp(1_900_000_000, tz=timezone.utc)
     assert "Credits balance: $12.50" in snapshot.details
+
+
+def test_fetch_account_usage_codex_falls_back_to_runtime_token_account_metadata(monkeypatch):
+    def jwt(claims):
+        encode = lambda value: base64.urlsafe_b64encode(
+            json.dumps(value).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        return f"{encode({'alg': 'none'})}.{encode(claims)}.signature"
+
+    access_token = jwt(
+        {
+            "https://api.openai.com/profile": {
+                "email": "runtime-user@example.com",
+                "name": "Runtime User",
+            },
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct_runtime",
+                "chatgpt_plan_type": "pro",
+            },
+        }
+    )
+    monkeypatch.setattr(
+        "agent.account_usage.resolve_codex_runtime_credentials",
+        lambda refresh_if_expiring=True: {
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": access_token,
+        },
+    )
+    monkeypatch.setattr(
+        "agent.account_usage._read_codex_tokens",
+        lambda: {"tokens": {"account_id": "stale-singleton-account"}},
+        raising=False,
+    )
+    client = _Client(
+        {
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 25,
+                    "reset_at": 1_900_000_000,
+                }
+            },
+        }
+    )
+    monkeypatch.setattr(
+        "agent.account_usage.httpx.Client",
+        lambda timeout=15.0: client,
+    )
+
+    snapshot = fetch_account_usage("openai-codex")
+
+    assert snapshot is not None
+    assert snapshot.account_email == "runtime-user@example.com"
+    assert snapshot.account_label == "Runtime User"
+    assert snapshot.account_id == "acct_runtime"
+    assert client.last_headers is not None
+    assert client.last_headers["ChatGPT-Account-Id"] == "acct_runtime"
+
+
+def test_fetch_account_usage_codex_ignores_blank_response_account_metadata(monkeypatch):
+    def jwt(claims):
+        encode = lambda value: base64.urlsafe_b64encode(
+            json.dumps(value).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        return f"{encode({'alg': 'none'})}.{encode(claims)}.signature"
+
+    access_token = jwt(
+        {
+            "https://api.openai.com/profile": {
+                "email": "runtime-user@example.com",
+                "name": "Runtime User",
+            },
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct_runtime",
+            },
+        }
+    )
+    monkeypatch.setattr(
+        "agent.account_usage.resolve_codex_runtime_credentials",
+        lambda refresh_if_expiring=True: {
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": access_token,
+        },
+    )
+    client = _Client(
+        {
+            "account_email": "   ",
+            "account_label": "\t",
+            "account_id": "\n",
+            "account": {"email": " ", "label": "", "id": "  "},
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 25,
+                    "reset_at": 1_900_000_000,
+                }
+            },
+        }
+    )
+    monkeypatch.setattr("agent.account_usage.httpx.Client", lambda timeout=15.0: client)
+
+    snapshot = fetch_account_usage("openai-codex")
+
+    assert snapshot is not None
+    assert snapshot.account_email == "runtime-user@example.com"
+    assert snapshot.account_label == "Runtime User"
+    assert snapshot.account_id == "acct_runtime"
+    assert client.last_headers is not None
+    assert client.last_headers["ChatGPT-Account-Id"] == "acct_runtime"
+
+
+def test_fetch_account_usage_codex_never_borrows_singleton_id_for_opaque_runtime_token(monkeypatch):
+    monkeypatch.setattr(
+        "agent.account_usage.resolve_codex_runtime_credentials",
+        lambda refresh_if_expiring=True: {
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "opaque-runtime-token",
+        },
+    )
+    monkeypatch.setattr(
+        "agent.account_usage._read_codex_tokens",
+        lambda: {"tokens": {"account_id": "acct_other_singleton"}},
+        raising=False,
+    )
+    client = _Client(
+        {
+            "email": "runtime-response@example.com",
+            "account_id": "acct_from_usage_response",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 25,
+                    "reset_at": 1_900_000_000,
+                }
+            },
+        }
+    )
+    monkeypatch.setattr("agent.account_usage.httpx.Client", lambda timeout=15.0: client)
+
+    snapshot = fetch_account_usage("openai-codex")
+
+    assert snapshot is not None
+    assert snapshot.account_email == "runtime-response@example.com"
+    assert snapshot.account_id == "acct_from_usage_response"
+    assert client.last_headers is not None
+    assert "ChatGPT-Account-Id" not in client.last_headers
 
 
 def test_render_account_usage_lines_includes_reset_and_provider():
