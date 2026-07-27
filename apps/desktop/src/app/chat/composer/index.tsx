@@ -1,6 +1,15 @@
 import { ComposerPrimitive } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
-import { type ClipboardEvent, type FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useRef } from 'react'
+import {
+  type ClipboardEvent,
+  type FormEvent,
+  type KeyboardEvent,
+  type MouseEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef
+} from 'react'
 
 import { composerFill, composerSurfaceGlass } from '@/components/chat/composer-dock'
 import { Button } from '@/components/ui/button'
@@ -52,9 +61,11 @@ import { useSlashCompletions } from './hooks/use-slash-completions'
 import { useSessionStatusPresence } from './hooks/use-status-presence'
 import { QueuePanel } from './queue-panel'
 import {
+  chipForRemoveTarget,
   composerPlainText,
   deleteChipBeforeCaret,
   deleteSelectionInEditor,
+  detachChip,
   insertComposerContentsAtCaret,
   normalizeComposerEditorDom,
   RICH_INPUT_SLOT
@@ -381,6 +392,26 @@ export function ChatBar({
     }
 
     scheduleFlushEditorToDraft(event.currentTarget)
+  }
+
+  // Chip remove button. Delegated from the editor because chips are rebuilt on
+  // every draft→DOM pass — a listener per chip would pile up on each rebuild.
+  // mousedown rather than click, with preventDefault, so the caret never lands
+  // inside the chip we are about to remove.
+  const handleEditorMouseDown = (event: MouseEvent<HTMLDivElement>) => {
+    const chip = chipForRemoveTarget(event.target)
+
+    if (!chip) {
+      return
+    }
+
+    event.preventDefault()
+    withUndoPoint(() => {
+      detachChip(chip)
+
+      return true
+    })
+    flushEditorToDraft(event.currentTarget)
   }
 
   // Native typing/deleting mutates the DOM through Chromium's editing pipeline,
@@ -903,6 +934,7 @@ export function ChatBar({
         onInput={handleEditorInput}
         onKeyDown={handleEditorKeyDown}
         onKeyUp={handleEditorKeyUp}
+        onMouseDown={handleEditorMouseDown}
         onMouseUp={refreshTrigger}
         onPaste={handlePaste}
         ref={editorRef}

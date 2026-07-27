@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest'
 
 import { insertInlineRefsIntoEditor } from './inline-refs'
 import {
+  chipForRemoveTarget,
   composerPlainText,
   deleteSelectionInEditor,
+  detachChip,
   insertComposerContentsAtCaret,
   normalizeComposerEditorDom,
   refChipElement,
@@ -219,5 +221,72 @@ describe('deleteSelectionInEditor', () => {
     expect(deleteSelectionInEditor(editor)).toBe(false)
 
     editor.remove()
+  })
+})
+
+describe('chip remove button', () => {
+  const chipIn = (editor: HTMLElement, kind: string, value: string) => {
+    const chip = refChipElement(kind, value)
+
+    editor.append(chip, document.createTextNode(' '))
+
+    return chip
+  }
+
+  it('gives a composer chip a remove control', () => {
+    const chip = refChipElement('selection', '`_selection-1`')
+
+    expect(chip.querySelector('[data-chip-remove]')).not.toBeNull()
+  })
+
+  // The button lives inside the chip, and composerPlainText returns the chip's
+  // data-ref-text without descending — so the glyph must never reach the draft.
+  it('keeps the glyph out of the serialized draft', () => {
+    const editor = document.createElement('div')
+
+    editor.dataset.slot = RICH_INPUT_SLOT
+    chipIn(editor, 'selection', '`_selection-1`')
+
+    expect(composerPlainText(editor)).toBe('@selection:`_selection-1` ')
+    expect(composerPlainText(editor)).not.toContain('×')
+  })
+
+  it('resolves the owning chip from a click on the button', () => {
+    const editor = document.createElement('div')
+    const chip = chipIn(editor, 'terminal', '`build`')
+    const button = chip.querySelector('[data-chip-remove]')!
+
+    expect(chipForRemoveTarget(button)).toBe(chip)
+    // A click on the chip body must NOT be treated as a remove.
+    expect(chipForRemoveTarget(chip)).toBeNull()
+    expect(chipForRemoveTarget(editor)).toBeNull()
+  })
+
+  // Same cleanup the Backspace path performs: drop the auto-inserted space so a
+  // removed chip cannot strand one behind.
+  it('detaches the chip and its auto-inserted trailing space', () => {
+    const editor = document.createElement('div')
+
+    editor.dataset.slot = RICH_INPUT_SLOT
+
+    const chip = chipIn(editor, 'selection', '`_selection-1`')
+
+    editor.append(document.createTextNode('after'))
+    detachChip(chip)
+
+    expect(composerPlainText(editor)).toBe('after')
+  })
+
+  it('keeps real following text when it is not just the auto space', () => {
+    const editor = document.createElement('div')
+
+    editor.dataset.slot = RICH_INPUT_SLOT
+
+    const chip = refChipElement('selection', '`_selection-1`')
+
+    editor.append(chip, document.createTextNode(' tail'))
+    detachChip(chip)
+
+    expect(composerPlainText(editor)).toBe('tail')
   })
 })

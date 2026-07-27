@@ -81,6 +81,36 @@ export function refChipHtml(kind: string, rawValue: string, displayLabel?: strin
   return `<span contenteditable="false"${titleAttr} data-ref-text="${escapeHtml(text)}" data-ref-id="${escapeHtml(id)}" data-ref-kind="${escapeHtml(kind)}" class="${DIRECTIVE_CHIP_CLASS}"${previewAttr}>${directiveIconSvg(kind)}<span class="truncate">${escapeHtml(label)}</span></span>`
 }
 
+const CHIP_REMOVE_ATTR = 'data-chip-remove'
+
+/**
+ * The chip's own remove affordance.
+ *
+ * Backspace already deletes a chip, but only with the caret parked immediately
+ * after it — there was no way to drop one with the mouse, which is how people
+ * reach for it. Hidden until the chip is hovered so a row of refs stays quiet.
+ *
+ * Not tab-reachable on purpose: inside a contenteditable a focusable child
+ * fights the caret, and the keyboard already has the Backspace path.
+ */
+function chipRemoveButton() {
+  const button = document.createElement('button')
+
+  button.type = 'button'
+  button.tabIndex = -1
+  button.setAttribute(CHIP_REMOVE_ATTR, 'true')
+  button.setAttribute(
+    'aria-label',
+    navigator.language.toLowerCase().startsWith('zh') ? '移除引用' : 'Remove reference'
+  )
+  button.className =
+    'ml-0.5 shrink-0 rounded-sm px-0.5 leading-none opacity-0 transition-opacity ' +
+    'hover:text-foreground group-hover/chip:opacity-100'
+  button.textContent = '×'
+
+  return button
+}
+
 export function refChipElement(kind: string, rawValue: string, displayLabel?: string) {
   const id = unquoteRef(rawValue)
   const text = `@${kind}:${quoteRefValue(id)}`
@@ -92,7 +122,9 @@ export function refChipElement(kind: string, rawValue: string, displayLabel?: st
   chip.dataset.refText = text
   chip.dataset.refId = id
   chip.dataset.refKind = kind
-  chip.className = DIRECTIVE_CHIP_CLASS
+  // `group/chip` only on the composer's chip: the same class constant renders
+  // chips inside sent messages, which have no remove button to reveal.
+  chip.className = `${DIRECTIVE_CHIP_CLASS} group/chip`
 
   if (preview) {
     chip.dataset.refPreview = preview
@@ -102,7 +134,7 @@ export function refChipElement(kind: string, rawValue: string, displayLabel?: st
 
   label.className = 'truncate'
   label.textContent = displayLabel || refChipLabel(kind, id)
-  chip.append(directiveIconElement(kind), label)
+  chip.append(directiveIconElement(kind), label, chipRemoveButton())
 
   return chip
 }
@@ -235,6 +267,42 @@ export function replaceBeforeCaret(editor: HTMLElement, length: number, fragment
   return true
 }
 
+/** Remove a chip and the single space auto-inserted after it, returning whatever
+ *  followed. Shared by the Backspace path and the chip's own remove button so
+ *  both leave the draft in the same shape — a chip dropped one way must not
+ *  strand a space the other way cleans up. */
+export function detachChip(chip: ChildNode): ChildNode | null {
+  const after = chip.nextSibling
+
+  chip.remove()
+
+  // Drop the auto-inserted trailing space; keep any real following text.
+  if (after?.nodeType === Node.TEXT_NODE) {
+    const text = after.textContent ?? ''
+
+    if (text === ' ') {
+      after.remove()
+    } else if (text.startsWith(' ')) {
+      after.textContent = text.slice(1)
+    }
+  }
+
+  return after
+}
+
+/** The chip a remove-button click belongs to, or null when the click was not on
+ *  one. Resolved by delegation from the editor: chips are re-created on every
+ *  draft→DOM pass, so per-chip listeners would pile up and leak. */
+export function chipForRemoveTarget(target: EventTarget | null): HTMLElement | null {
+  if (!(target instanceof Element) || !target.closest(`[${CHIP_REMOVE_ATTR}]`)) {
+    return null
+  }
+
+  const chip = target.closest<HTMLElement>('[data-ref-text]')
+
+  return chip?.dataset.refText ? chip : null
+}
+
 /** Backspace at a collapsed caret immediately after a chip: delete the chip AND
  *  the single trailing space we auto-insert after it, atomically — so removing a
  *  directive never strands an orphaned space (the contenteditable-driven cleanup
@@ -259,20 +327,7 @@ export function deleteChipBeforeCaret(editor: HTMLElement): boolean {
     return false
   }
 
-  const after = chip.nextSibling
-  chip.remove()
-
-  // Drop the auto-inserted trailing space; keep any real following text.
-  if (after?.nodeType === Node.TEXT_NODE) {
-    const text = after.textContent ?? ''
-
-    if (text === ' ') {
-      after.remove()
-    } else if (text.startsWith(' ')) {
-      after.textContent = text.slice(1)
-    }
-  }
-
+  const after = detachChip(chip)
   const caret = document.createRange()
 
   if (after?.isConnected) {
