@@ -453,16 +453,26 @@ export function nextComposerContextReferenceLabel(kind: ComposerContextReference
   // setComposerContextReference overwrites its text, and nothing references it.
   const taken = liveContextReferenceKeys()
 
-  if (!taken.has(contextReferenceKey(kind, base))) {
-    return base
-  }
-
-  for (let index = 2; index < 1000; index += 1) {
+  // Always suffixed, starting at 1. A bare first label followed by `-2` reads as
+  // a numbering glitch; a plain `@selection:_selection` chip that has no counter
+  // beside it looks unrelated to the `-2` next to it. Older drafts holding the
+  // un-suffixed form keep working — the label is just a key, so `_selection`
+  // stays resolvable while it is still live.
+  for (let index = 1; index < 1000; index += 1) {
     const candidate = `${base}-${index}`
 
-    if (!taken.has(contextReferenceKey(kind, candidate))) {
-      return candidate
+    if (taken.has(contextReferenceKey(kind, candidate))) {
+      continue
     }
+
+    // A live un-suffixed label (written before numbering started at 1) occupies
+    // slot 1. Handing out `_selection-1` beside it would show two chips that read
+    // as unrelated rather than as a sequence.
+    if (index === 1 && taken.has(contextReferenceKey(kind, base))) {
+      continue
+    }
+
+    return candidate
   }
 
   return `${base}-${Date.now()}`

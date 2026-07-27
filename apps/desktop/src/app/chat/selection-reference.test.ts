@@ -87,42 +87,60 @@ describe('selection labels do not climb forever', () => {
     setComposerDraft('')
   })
 
+  // Numbering starts at 1 rather than leaving the first label bare: a chip
+  // reading `_selection` sitting next to one reading `_selection-2` looks like a
+  // numbering glitch rather than a sequence.
+  it('suffixes the very first label', () => {
+    expect(nextComposerContextReferenceLabel('selection', '_selection')).toBe('_selection-1')
+  })
+
   it('numbers a second reference only while the first chip is still in a draft', () => {
-    setComposerSelectionReference('_selection', 'first')
-    setComposerDraft('@selection:`_selection` and')
+    setComposerSelectionReference('_selection-1', 'first')
+    setComposerDraft('@selection:`_selection-1` and')
     expect(nextComposerContextReferenceLabel('selection', '_selection')).toBe('_selection-2')
   })
 
   // The reported bug: the counter climbed on every quote because a deleted chip's
   // reference stayed in the map and its label was treated as taken forever.
-  it('reuses the base label after the chip is deleted from the draft', () => {
-    setComposerSelectionReference('_selection', 'first')
-    setComposerDraft('@selection:`_selection` and')
+  it('reuses the lowest label after the chip is deleted from the draft', () => {
+    setComposerSelectionReference('_selection-1', 'first')
+    setComposerDraft('@selection:`_selection-1` and')
     expect(nextComposerContextReferenceLabel('selection', '_selection')).toBe('_selection-2')
 
     setComposerDraft('')
-    expect(nextComposerContextReferenceLabel('selection', '_selection')).toBe('_selection')
+    expect(nextComposerContextReferenceLabel('selection', '_selection')).toBe('_selection-1')
+  })
+
+  // Drafts written before numbering started at 1 still hold the un-suffixed form.
+  // It stays resolvable, and it occupies slot 1 so the next chip reads as the
+  // second in a sequence rather than an unrelated `_selection-1` beside it.
+  it('keeps a legacy un-suffixed chip resolvable and holding slot 1', () => {
+    setComposerSelectionReference('_selection', 'legacy quote')
+    setComposerDraft('@selection:`_selection` kept')
+
+    expect(composerContextReferenceText('selection', '_selection')).toBe('legacy quote')
+    expect(nextComposerContextReferenceLabel('selection', '_selection')).toBe('_selection-2')
   })
 
   it('keeps a label taken while another session still shows that chip', () => {
-    setComposerSelectionReference('_selection', 'first')
-    stashSessionDraft('other-session', '@selection:`_selection` kept', [])
+    setComposerSelectionReference('_selection-1', 'first')
+    stashSessionDraft('other-session', '@selection:`_selection-1` kept', [])
     setComposerDraft('')
     expect(nextComposerContextReferenceLabel('selection', '_selection')).toBe('_selection-2')
   })
 
   it('keeps a label taken while a queued prompt still uses that chip', () => {
-    setComposerSelectionReference('_selection', 'queued quote')
+    setComposerSelectionReference('_selection-1', 'queued quote')
     enqueueQueuedPrompt('queued-session', {
       attachments: [],
-      text: '@selection:`_selection` send this later'
+      text: '@selection:`_selection-1` send this later'
     })
     setComposerDraft('')
 
     expect(nextComposerContextReferenceLabel('selection', '_selection')).toBe('_selection-2')
 
     reconcileComposerContextReferences('')
-    expect(composerContextReferenceText('selection', '_selection')).toBe('queued quote')
+    expect(composerContextReferenceText('selection', '_selection-1')).toBe('queued quote')
   })
 })
 
@@ -214,7 +232,7 @@ describe('selection references survive a restart', () => {
     const store = await import('@/store/composer')
 
     expect(store.$composerContextReferences.get()).toEqual({})
-    expect(store.nextComposerContextReferenceLabel('selection', '_selection')).toBe('_selection')
+    expect(store.nextComposerContextReferenceLabel('selection', '_selection')).toBe('_selection-1')
   })
 
   it('ignores a corrupt payload instead of throwing on load', async () => {
