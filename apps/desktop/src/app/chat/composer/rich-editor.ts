@@ -132,7 +132,11 @@ export function refChipElement(kind: string, rawValue: string, displayLabel?: st
     chip.title = id
   }
 
-  label.className = 'truncate'
+  // min-w-0 is what lets `truncate` actually shrink here: a flex item defaults to
+  // min-width:auto, i.e. its content width, so a long label refuses to compress
+  // and pushes the shrink-0 remove button out of the chip's max-w-56 box — the
+  // longer the quote, the further out of reach the × goes.
+  label.className = 'min-w-0 truncate'
   label.textContent = displayLabel || refChipLabel(kind, id)
   chip.append(directiveIconElement(kind), label, chipRemoveButton())
 

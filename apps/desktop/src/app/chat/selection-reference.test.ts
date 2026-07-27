@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { refChipElement, refChipHtml } from '@/app/chat/composer/rich-editor'
+import { composerPlainText, detachChip, refChipElement, refChipHtml } from '@/app/chat/composer/rich-editor'
 import { $queuedPromptsBySession, enqueueQueuedPrompt } from '@/store/composer-queue'
 import {
   $composerContextReferences,
@@ -242,5 +242,77 @@ describe('selection references survive a restart', () => {
     const store = await import('@/store/composer')
 
     expect(store.$composerContextReferences.get()).toEqual({})
+  })
+})
+
+// Answers a direct question: after clicking a chip's ×, does the prompt still
+// carry that quote? Expansion is driven by the DRAFT TEXT (submit.ts reads
+// terminalContextBlocksFromDraft(rawText)), not by the store, so a chip removed
+// from the DOM drops out even while its entry lingers in the map.
+describe('removing a chip drops its quote from the prompt', () => {
+  beforeEach(() => {
+    window.localStorage.clear()
+    $composerContextReferences.set({})
+    // Earlier cases in this file leave drafts holding `_selection-1`. Liveness is
+    // computed across ALL drafts, so without clearing them the reconcile case
+    // would see a reference another draft still uses and correctly refuse to
+    // drop it — a test-isolation artefact, not product behaviour.
+    $queuedPromptsBySession.set({})
+    clearSessionDraft(null)
+    clearSessionDraft('other-session')
+    setComposerDraft('')
+  })
+
+  const editorWith = (...chips: HTMLElement[]) => {
+    const editor = document.createElement('div')
+
+    chips.forEach(chip => editor.append(chip, document.createTextNode(' ')))
+
+    return editor
+  }
+
+  it('expands only the references still present in the draft', () => {
+    setComposerSelectionReference('_selection-1', 'first quote')
+    setComposerSelectionReference('_selection-2', 'second quote')
+
+    const first = refChipElement('selection', '`_selection-1`')
+    const second = refChipElement('selection', '`_selection-2`')
+    const editor = editorWith(first, second)
+
+    expect(composerContextBlocksFromDraft(composerPlainText(editor))).toHaveLength(2)
+
+    detachChip(first)
+
+    const blocks = composerContextBlocksFromDraft(composerPlainText(editor))
+
+    expect(blocks).toHaveLength(1)
+    expect(blocks[0]).toContain('second quote')
+    expect(blocks.join('\n')).not.toContain('first quote')
+  })
+
+  it('carries nothing once every chip is removed', () => {
+    setComposerSelectionReference('_selection-1', 'only quote')
+
+    const chip = refChipElement('selection', '`_selection-1`')
+    const editor = editorWith(chip)
+
+    detachChip(chip)
+
+    expect(composerPlainText(editor)).toBe('')
+    expect(composerContextBlocksFromDraft(composerPlainText(editor))).toEqual([])
+  })
+
+  // The store entry outliving the chip is harmless for the prompt, but it must
+  // not resurrect: reconcile against the emptied draft clears it for good.
+  it('reconciles the orphaned entry away after removal', () => {
+    setComposerSelectionReference('_selection-1', 'only quote')
+
+    const chip = refChipElement('selection', '`_selection-1`')
+    const editor = editorWith(chip)
+
+    detachChip(chip)
+    reconcileComposerContextReferences(composerPlainText(editor))
+
+    expect(composerContextReferenceText('selection', '_selection-1')).toBe('')
   })
 })
