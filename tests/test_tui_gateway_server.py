@@ -17,6 +17,39 @@ from hermes_cli.browser_connect import ChromeDebugLaunch
 from tui_gateway import server
 
 
+def test_tui_gateway_entry_imports_cleanly_from_background_thread():
+    """Desktop builds agents on a worker thread, which may first-import entry."""
+    repo_root = Path(__file__).resolve().parents[1]
+    script = """
+import threading
+
+errors = []
+
+def load_entry():
+    try:
+        import tui_gateway.entry  # noqa: F401
+    except BaseException as exc:
+        errors.append(repr(exc))
+
+thread = threading.Thread(target=load_entry)
+thread.start()
+thread.join(timeout=30)
+if thread.is_alive():
+    raise SystemExit('background import timed out')
+if errors:
+    raise SystemExit(errors[0])
+"""
+    result = subprocess.run(
+        [sys.executable, '-c', script],
+        cwd=repo_root,
+        text=True,
+        capture_output=True,
+        timeout=45,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
 @pytest.fixture(autouse=True)
 def _neuter_agent_prewarm_timer(request, monkeypatch):
     """Stub the deferred agent pre-warm timer for every test in this module.
